@@ -23,8 +23,8 @@ path = "src/lib.rs"
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
-# Async runtime + HTTP (concurrent fan-out across repositories; lands in later phases)
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Async runtime + HTTP (concurrent fan-out across repositories)
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 futures = "0.3"
 
