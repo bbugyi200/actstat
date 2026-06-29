@@ -48,6 +48,8 @@ terminal_size = "0.4"
 [dev-dependencies]
 # Mock HTTP for GitHub client tests (Phase 3)
 wiremock = "0.6"
+# Isolated temp dirs for config-discovery tests (Phase 2)
+tempfile = "3"
 
 [profile.release]
 lto = "thin"
