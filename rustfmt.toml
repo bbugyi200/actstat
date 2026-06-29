@@ -1,0 +1,4 @@
+# Pin formatting so `cargo fmt` is reproducible across environments (incl. CI).
+# The codebase is formatted to 80 columns; without this file CI falls back to
+# rustfmt's default of 100 and `cargo fmt --check` fails. See the CI `lint` job.
+max_width = 80

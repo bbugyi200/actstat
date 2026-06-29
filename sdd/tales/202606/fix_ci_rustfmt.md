@@ -1,6 +1,6 @@
 ---
 create_time: 2026-06-29 10:04:01
-status: wip
+status: done
 prompt: sdd/prompts/202606/fix_ci_rustfmt.md
 ---
 # Plan: Fix failing CI `lint` job (rustfmt config drift)
