@@ -1,0 +1,54 @@
+[package]
+name = "actstat"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Fast, beautiful CLI reporting the status of recent GitHub Actions workflow runs across many repositories."
+authors = ["Bryan Bugyi <bryanbugyi34@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/bbugyi200/actstat"
+readme = "README.md"
+keywords = ["github", "actions", "ci", "cli", "status"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "actstat"
+path = "src/main.rs"
+
+[lib]
+name = "actstat"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Async runtime + HTTP (concurrent fan-out across repositories; lands in later phases)
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9" # maintained serde_yaml fork, for config parsing (Phase 2)
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Time
+jiff = "0.2"
+
+# Terminal styling (adaptive, NO_COLOR/TTY aware)
+owo-colors = "4"
+anstream = "0.6"
+terminal_size = "0.4"
+
+[dev-dependencies]
+# Mock HTTP for GitHub client tests (Phase 3)
+wiremock = "0.6"
+
+[profile.release]
+lto = "thin"
+strip = true
