@@ -32,5 +32,8 @@ fmt:
 clippy:
     cargo clippy --all-targets -- -D warnings
 
-# Full pre-commit gate: format check, lint, test.
-check: fmt-check clippy test
+# Lint: format check + clippy (no tests). Used by CI (`just lint`).
+lint: fmt-check clippy
+
+# Full pre-commit gate: lint + test.
+check: lint test

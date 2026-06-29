@@ -1,6 +1,6 @@
 ---
 create_time: 2026-06-29 09:46:32
-status: wip
+status: done
 prompt: sdd/prompts/202606/github_actions_ci.md
 ---
 # Plan: GitHub Actions CI for lint + test (`just lint` / `just test`)

@@ -1,5 +1,7 @@
 # actstat
 
+[![CI](https://github.com/bbugyi200/actstat/actions/workflows/ci.yml/badge.svg)](https://github.com/bbugyi200/actstat/actions/workflows/ci.yml)
+
 A fast, beautiful Rust CLI that reports the status of the most recent settled
 default-branch GitHub Actions commits across a configured set of repositories.
 
