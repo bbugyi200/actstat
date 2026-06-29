@@ -7,13 +7,16 @@
 //! is enabled — so you use either the top-level args *or* the subcommand, and
 //! both resolve to the same [`ListArgs`].
 
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::model::Report;
+use crate::config::{self, RepoName};
+use crate::github::{self, DiscoveredToken};
+use crate::model::{RepoReport, Report};
 use crate::render;
 
 /// Report the status of recent GitHub Actions workflow runs across repos.
@@ -151,37 +154,197 @@ pub fn use_color(choice: ColorChoice) -> bool {
 }
 
 /// Parse the process arguments and run, returning the process exit code.
+///
+/// Collection is I/O-bound fan-out over many repositories, so this drives an
+/// async [`run_list`] on a Tokio runtime. A runtime that fails to start is an
+/// operational error (exit `1`).
 pub fn run() -> ExitCode {
     let args = Cli::parse().list_args();
-    run_list(&args)
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "actstat: failed to start async runtime: {e}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    runtime.block_on(run_list(args))
 }
 
-/// Execute the `list` command. Phase 1 uses a network-free stub [`Report`] so
-/// every format can be exercised end-to-end; later phases swap in real data.
-pub fn run_list(args: &ListArgs) -> ExitCode {
+/// Execute the `list` command end to end: load config, resolve repositories,
+/// collect their recent run status, render the chosen format to stdout, and
+/// return the exit code per the documented table.
+///
+/// Diagnostics, warnings, and progress go to stderr so machine output on stdout
+/// stays pipe-clean; per-repository and per-org failures become inline rows
+/// rather than aborting the run.
+async fn run_list(args: ListArgs) -> ExitCode {
+    // 1. Configuration — a missing/invalid config is an operational error.
+    let config = match config::load(args.config.as_deref()) {
+        Ok(config) => config,
+        Err(e) => return config_error_exit(&e),
+    };
+
+    // 2. Token discovery — warn (but proceed) when unauthenticated.
+    let token = github::discover_token();
+    if !args.quiet {
+        if let Some(warning) = token.unauthenticated_warning() {
+            let _ = writeln!(std::io::stderr(), "actstat: warning: {warning}");
+        }
+    }
     if args.verbose > 0 && !args.quiet {
-        // Diagnostics go to stderr so stdout stays pipe-clean.
+        diag_token_source(&token);
+    }
+
+    // 3. GitHub client — a client that cannot be built is fatal.
+    let client = match github::GitHubClient::github(token.token) {
+        Ok(client) => client,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "actstat: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // 4. Expand orgs + merge explicit repos into a sorted, de-duplicated list.
+    let resolved =
+        github::resolve_repositories(&client, &config, args.concurrency).await;
+
+    // 5. Honor --repo (a malformed value is a usage error, exit 2).
+    let repos = match filter_repos(resolved.repos, &args.repos) {
+        Ok(repos) => repos,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "actstat: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if args.verbose > 0 && !args.quiet {
         let _ = writeln!(
             std::io::stderr(),
-            "actstat: limit={} format={:?} repos={:?} (stub data; no network in phase 1)",
+            "actstat: inspecting {} repositor{} (limit={}, concurrency={})",
+            repos.len(),
+            if repos.len() == 1 { "y" } else { "ies" },
             args.limit,
-            args.format,
-            args.repos,
+            args.concurrency,
         );
     }
 
-    let report = Report::stub(args.limit);
+    // 6. Fan out collection, then fold any org-expansion failures in as rows.
+    let mut reports = github::collect_repo_reports(
+        &client,
+        repos,
+        args.limit,
+        args.concurrency,
+    )
+    .await;
+    reports.extend(org_error_reports(resolved.org_errors));
+    reports.sort_by(|a, b| a.repo.cmp(&b.repo));
+
+    // 7. The single report every renderer reads from.
+    let report = Report {
+        generated_at: now_rfc3339(),
+        limit: args.limit,
+        repos: reports,
+    };
+
+    // 8. Render to stdout.
     let rendered = render::render(
         &report,
         args.format,
         use_color(args.color),
         args.only_failures,
     );
-
-    // Machine + human output both go to stdout.
     print!("{rendered}");
 
-    if args.fail_on_failure && report.has_failures() {
+    // 9. Exit code per the documented table.
+    list_exit_code(&report, args.fail_on_failure)
+}
+
+/// Print a config error to stderr and return the operational-error exit code.
+/// A "no config found" error is paired with a minimal example to get going.
+fn config_error_exit(err: &config::ConfigError) -> ExitCode {
+    let _ = writeln!(std::io::stderr(), "actstat: {err}");
+    if matches!(err, config::ConfigError::NotFound(_)) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "\nexample config:\n\n{}",
+            config::example_config()
+        );
+    }
+    ExitCode::from(1)
+}
+
+/// Emit a stderr diagnostic naming where the token came from (verbose only).
+fn diag_token_source(token: &DiscoveredToken) {
+    use github::TokenSource;
+    let source = match &token.source {
+        TokenSource::Env(name) => format!("environment variable {name}"),
+        TokenSource::GhCli => "`gh auth token`".to_string(),
+        TokenSource::Unauthenticated => "none (unauthenticated)".to_string(),
+    };
+    let _ = writeln!(std::io::stderr(), "actstat: token source: {source}");
+}
+
+/// Turn org-expansion failures into inline error rows so a single failed org
+/// surfaces in the report instead of aborting the run.
+fn org_error_reports(org_errors: Vec<(String, String)>) -> Vec<RepoReport> {
+    org_errors
+        .into_iter()
+        .map(|(org, message)| RepoReport {
+            repo: org,
+            runs: vec![],
+            error: Some(format!("failed to expand org: {message}")),
+        })
+        .collect()
+}
+
+/// Restrict `repos` to the `--repo` selection, if any. With no selection the
+/// full resolved set is returned unchanged. Requested entries are validated as
+/// `owner/name` (a malformed one is an error) and matched against the resolved
+/// set, so an entry that isn't configured is simply dropped.
+fn filter_repos(
+    repos: Vec<RepoName>,
+    requested: &[String],
+) -> Result<Vec<RepoName>, String> {
+    if requested.is_empty() {
+        return Ok(repos);
+    }
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+    for raw in requested {
+        wanted.insert(RepoName::parse(raw)?.full_name());
+    }
+    Ok(repos
+        .into_iter()
+        .filter(|r| wanted.contains(&r.full_name()))
+        .collect())
+}
+
+/// The current time as an RFC3339 timestamp for [`Report::generated_at`].
+fn now_rfc3339() -> String {
+    jiff::Timestamp::now().to_string()
+}
+
+/// Whether every inspected repository produced an error (and there was at least
+/// one). This is an operational failure — distinct from a normal run where some
+/// repositories are simply red.
+fn all_repos_errored(report: &Report) -> bool {
+    !report.repos.is_empty() && report.repos.iter().all(|r| r.error.is_some())
+}
+
+/// Map a rendered report to its process exit code per the documented table:
+///
+/// - `1` — operational failure (here: every inspected repository errored).
+/// - `2` — `--fail-on-failure` is set and at least one inspected run was
+///   non-successful.
+/// - `0` — otherwise; the run completed and conclusions were reported.
+fn list_exit_code(report: &Report, fail_on_failure: bool) -> ExitCode {
+    if all_repos_errored(report) {
+        ExitCode::from(1)
+    } else if fail_on_failure && report.has_failures() {
         ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
@@ -327,13 +490,98 @@ mod tests {
         assert!(use_color(ColorChoice::Always));
     }
 
+    // --- Exit-code policy (pure) ----------------------------------------
+
+    /// Compare two `ExitCode`s by their debug rendering (they aren't `PartialEq`).
+    fn same_code(a: ExitCode, b: ExitCode) -> bool {
+        format!("{a:?}") == format!("{b:?}")
+    }
+
     #[test]
-    fn fail_on_failure_yields_exit_two_on_failures() {
-        // The stub report contains a failing run.
-        let args = parse(&["actstat", "--fail-on-failure", "--color", "never"])
+    fn exit_two_when_fail_on_failure_and_a_run_failed() {
+        // The stub report mixes a passing run, a failing run, and an error row.
+        let report = Report::stub(1);
+        assert!(report.has_failures());
+        assert!(!all_repos_errored(&report), "the stub is not all-errored");
+        assert!(same_code(list_exit_code(&report, true), ExitCode::from(2)));
+    }
+
+    #[test]
+    fn exit_zero_without_fail_on_failure_even_with_red_runs() {
+        let report = Report::stub(1);
+        assert!(same_code(list_exit_code(&report, false), ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn exit_one_when_every_repository_errored() {
+        let mut report = Report::stub(1);
+        report.repos.retain(|r| r.error.is_some());
+        assert!(all_repos_errored(&report));
+        // Exit 1 wins over --fail-on-failure.
+        assert!(same_code(list_exit_code(&report, true), ExitCode::from(1)));
+    }
+
+    #[test]
+    fn exit_zero_for_an_empty_report() {
+        let report = Report {
+            generated_at: "2026-06-29T12:00:00Z".to_string(),
+            limit: 1,
+            repos: vec![],
+        };
+        assert!(!all_repos_errored(&report), "no repos is not 'all errored'");
+        assert!(same_code(list_exit_code(&report, true), ExitCode::SUCCESS));
+    }
+
+    // --- --repo filtering (pure) ----------------------------------------
+
+    fn repo(owner: &str, name: &str) -> RepoName {
+        RepoName::parse(&format!("{owner}/{name}")).unwrap()
+    }
+
+    #[test]
+    fn filter_repos_without_selection_returns_everything() {
+        let repos = vec![repo("o", "a"), repo("o", "b")];
+        let out = filter_repos(repos.clone(), &[]).unwrap();
+        assert_eq!(out, repos);
+    }
+
+    #[test]
+    fn filter_repos_keeps_only_the_selected_and_drops_unconfigured() {
+        let repos = vec![repo("o", "a"), repo("o", "b"), repo("o", "c")];
+        let out = filter_repos(
+            repos,
+            &[
+                "o/b".to_string(),
+                "o/c".to_string(),
+                "o/not-configured".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(out, vec![repo("o", "b"), repo("o", "c")]);
+    }
+
+    #[test]
+    fn filter_repos_rejects_a_malformed_selection() {
+        let err = filter_repos(vec![repo("o", "a")], &["bogus".to_string()])
+            .unwrap_err();
+        assert!(err.contains("owner/name"), "got: {err}");
+    }
+
+    // --- org error rows -------------------------------------------------
+
+    #[test]
+    fn org_errors_become_inline_error_rows() {
+        let rows = org_error_reports(vec![(
+            "bad-org".to_string(),
+            "not found (404): Not Found".to_string(),
+        )]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repo, "bad-org");
+        assert!(rows[0].runs.is_empty());
+        assert!(rows[0]
+            .error
+            .as_deref()
             .unwrap()
-            .list_args();
-        let code = run_list(&args);
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+            .contains("failed to expand org"));
     }
 }
