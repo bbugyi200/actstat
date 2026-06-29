@@ -18,11 +18,15 @@
 //! 4. [`resolve_repositories`] — expand every configured org (bounded
 //!    concurrency), then merge with the explicit repos through Phase 2's
 //!    [`resolve_repos`] into one de-duplicated, alphabetically-stable list.
-//! 5. [`fetch_repo_reports`] — run a per-repository async operation across many
+//! 5. [`GitHubClient::list_completed_runs`] / [`GitHubClient::list_run_jobs`] —
+//!    fetch the most recent completed runs for a repo and, for a non-successful
+//!    run, its failed jobs and steps, normalized into the [`RunReport`] tree.
+//! 6. [`fetch_repo_reports`] — run a per-repository async operation across many
 //!    repos with bounded concurrency, isolating each repo's failure into a
 //!    [`RepoReport`] error record so one bad repo never aborts the whole run.
-//!    Phase 4 supplies the real operation (fetch runs + enrich failures); the
-//!    fan-out, the concurrency bound, and the error isolation live here.
+//! 7. [`collect_repo_reports`] — the Phase 4 pipeline: fan out over the resolved
+//!    repos, fetching each one's completed runs and enriching its failures, into
+//!    a sorted list of [`RepoReport`]s ready for any renderer.
 
 use std::future::Future;
 use std::time::Duration;
@@ -35,7 +39,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::{resolve_repos, Config, OrgSource, RepoName};
-use crate::model::{RepoReport, RunReport};
+use crate::model::{Conclusion, JobReport, RepoReport, RunReport, StepReport};
 
 /// The real GitHub REST API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.github.com";
@@ -343,6 +347,93 @@ impl GitHubClient {
             .collect())
     }
 
+    /// Fetch the most recent completed workflow runs for one repository,
+    /// normalized into [`RunReport`]s (newest-completed-first, as GitHub orders
+    /// them).
+    ///
+    /// Issues a single `GET /repos/{owner}/{repo}/actions/runs?status=completed`
+    /// with `per_page` set to the requested `limit` (capped at the API maximum
+    /// of 100), so `limit` applies *per repository* and the common case costs
+    /// exactly one request. The returned runs carry no failure detail — use
+    /// [`GitHubClient::list_run_jobs`] to enrich non-successful runs, or
+    /// [`collect_repo_reports`] for the full pipeline.
+    pub async fn list_completed_runs(
+        &self,
+        repo: &RepoName,
+        limit: u32,
+    ) -> Result<Vec<RunReport>, GitHubError> {
+        Ok(self
+            .fetch_completed_runs(repo, limit)
+            .await?
+            .into_iter()
+            .map(|api| normalize_run(api).1)
+            .collect())
+    }
+
+    /// Fetch the failed jobs (and their failed steps) for one run.
+    ///
+    /// Issues `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` and keeps
+    /// only *non-successful* jobs, each carrying only its actionable failed
+    /// steps; successful/skipped jobs and passing steps are dropped so the
+    /// report shows just what is worth investigating. Only call this for a run
+    /// whose conclusion is non-successful.
+    pub async fn list_run_jobs(
+        &self,
+        repo: &RepoName,
+        run_id: u64,
+    ) -> Result<Vec<JobReport>, GitHubError> {
+        let path = format!(
+            "/repos/{}/{}/actions/runs/{run_id}/jobs?per_page=100",
+            repo.owner, repo.name
+        );
+        let response: JobsResponse = self.get(&path).await?;
+        Ok(response
+            .jobs
+            .into_iter()
+            .filter_map(normalize_job)
+            .collect())
+    }
+
+    /// Fetch + normalize one repository's completed runs and enrich each
+    /// non-successful run with its failed jobs/steps. The per-repo unit of work
+    /// behind [`collect_repo_reports`].
+    async fn collect_runs(
+        &self,
+        repo: &RepoName,
+        limit: u32,
+    ) -> Result<Vec<RunReport>, GitHubError> {
+        let api_runs = self.fetch_completed_runs(repo, limit).await?;
+        let mut runs = Vec::with_capacity(api_runs.len());
+        for api in api_runs {
+            let (run_id, mut run) = normalize_run(api);
+            // Successful runs need no job expansion; only spend a second request
+            // on runs that actually broke. `run_id == 0` only happens for a
+            // malformed payload missing the id — skip enrichment rather than
+            // building a bogus jobs URL.
+            if !run.conclusion.is_success() && run_id != 0 {
+                run.jobs = self.list_run_jobs(repo, run_id).await?;
+            }
+            runs.push(run);
+        }
+        Ok(runs)
+    }
+
+    /// The raw runs request shared by [`list_completed_runs`] (which drops the
+    /// id) and [`collect_runs`] (which keeps the id to fetch jobs).
+    async fn fetch_completed_runs(
+        &self,
+        repo: &RepoName,
+        limit: u32,
+    ) -> Result<Vec<ApiRun>, GitHubError> {
+        let per_page = limit.clamp(1, 100);
+        let path = format!(
+            "/repos/{}/{}/actions/runs?status=completed&per_page={per_page}",
+            repo.owner, repo.name
+        );
+        let response: RunsResponse = self.get(&path).await?;
+        Ok(response.workflow_runs)
+    }
+
     /// Fetch a single page, retrying transient failures per [`RetryConfig`].
     async fn get_page<T: DeserializeOwned>(
         &self,
@@ -495,6 +586,141 @@ struct ApiRepo {
 #[derive(Debug, Deserialize)]
 struct ApiOwner {
     login: String,
+}
+
+// --- Workflow run / job payloads & normalization ---------------------------
+
+/// Envelope of `GET /repos/{owner}/{repo}/actions/runs`.
+#[derive(Debug, Deserialize)]
+struct RunsResponse {
+    /// The runs; defaulted so a `{}`/partial body yields "no runs" rather than
+    /// a decode error.
+    #[serde(default)]
+    workflow_runs: Vec<ApiRun>,
+}
+
+/// One workflow run from the runs listing.
+///
+/// Every field tolerates absence (`#[serde(default)]`) so a partial or
+/// malformed payload degrades to sensible defaults instead of failing the whole
+/// repository — only the fields actually used by [`normalize_run`] are modeled.
+#[derive(Debug, Deserialize)]
+struct ApiRun {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    display_title: Option<String>,
+    #[serde(default)]
+    run_number: u64,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    head_branch: Option<String>,
+    #[serde(default)]
+    head_sha: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+/// Envelope of `GET /repos/{owner}/{repo}/actions/runs/{id}/jobs`.
+#[derive(Debug, Deserialize)]
+struct JobsResponse {
+    #[serde(default)]
+    jobs: Vec<ApiJob>,
+}
+
+/// One job within a run's jobs listing.
+#[derive(Debug, Deserialize)]
+struct ApiJob {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    steps: Vec<ApiStep>,
+}
+
+/// One step within a job.
+#[derive(Debug, Deserialize)]
+struct ApiStep {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    number: u64,
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
+/// Normalize one API run into a [`RunReport`], returning the run id alongside it
+/// (the id is needed to fetch jobs for non-successful runs but is not part of
+/// the rendered model). The head SHA is shortened to 7 characters.
+fn normalize_run(api: ApiRun) -> (u64, RunReport) {
+    let sha: String =
+        api.head_sha.unwrap_or_default().chars().take(7).collect();
+    let report = RunReport {
+        workflow: api.name.unwrap_or_default(),
+        title: api.display_title.unwrap_or_default(),
+        run_number: api.run_number,
+        event: api.event.unwrap_or_default(),
+        branch: api.head_branch.unwrap_or_default(),
+        sha,
+        conclusion: Conclusion::from_github(api.conclusion.as_deref()),
+        url: api.html_url.unwrap_or_default(),
+        created_at: api.created_at.unwrap_or_default(),
+        updated_at: api.updated_at.unwrap_or_default(),
+        jobs: vec![],
+    };
+    (api.id, report)
+}
+
+/// Normalize one API job into a [`JobReport`], or `None` if the job is not an
+/// actionable problem (so it is not attached to the run). Only failed steps are
+/// kept.
+fn normalize_job(api: ApiJob) -> Option<JobReport> {
+    let conclusion = Conclusion::from_github(api.conclusion.as_deref());
+    if !is_problem(conclusion) {
+        return None;
+    }
+    Some(JobReport {
+        name: api.name.unwrap_or_default(),
+        conclusion,
+        url: api.html_url.unwrap_or_default(),
+        steps: api.steps.into_iter().filter_map(normalize_step).collect(),
+    })
+}
+
+/// Normalize one API step into a [`StepReport`], or `None` if the step is not an
+/// actionable problem (passing/skipped steps are noise in a failure report).
+fn normalize_step(api: ApiStep) -> Option<StepReport> {
+    let conclusion = Conclusion::from_github(api.conclusion.as_deref());
+    if !is_problem(conclusion) {
+        return None;
+    }
+    Some(StepReport {
+        name: api.name.unwrap_or_default(),
+        number: api.number,
+        conclusion,
+    })
+}
+
+/// Whether a conclusion is an actionable problem worth surfacing in failure
+/// detail. Success, skipped, and neutral are *not* problems; everything else
+/// (failure, cancelled, timed_out, action_required, startup_failure, stale) is.
+fn is_problem(conclusion: Conclusion) -> bool {
+    !matches!(
+        conclusion,
+        Conclusion::Success | Conclusion::Skipped | Conclusion::Neutral
+    )
 }
 
 // --- HTTP helpers (pure, unit-testable) ------------------------------------
@@ -672,6 +898,29 @@ where
 
     reports.sort_by(|a, b| a.repo.cmp(&b.repo));
     reports
+}
+
+/// The Phase 4 collection pipeline: fan out over `repos` (bounded by
+/// `concurrency`), fetching each repository's `limit` most-recent completed runs
+/// and enriching every non-successful run with its failed jobs and steps.
+///
+/// Each repository is isolated by [`fetch_repo_reports`]: a repo that errors
+/// (no access, Actions disabled, rate-limited, malformed at the HTTP layer)
+/// becomes a [`RepoReport`] error row instead of aborting the run, and a repo
+/// with no completed runs becomes a neutral empty [`RepoReport`]. Results come
+/// back sorted by `owner/name`. Pair the returned `repos` with metadata to build
+/// a [`crate::model::Report`] for rendering.
+pub async fn collect_repo_reports(
+    client: &GitHubClient,
+    repos: Vec<RepoName>,
+    limit: u32,
+    concurrency: usize,
+) -> Vec<RepoReport> {
+    fetch_repo_reports(repos, concurrency, |repo| {
+        let client = client.clone();
+        async move { client.collect_runs(&repo, limit).await }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1165,5 +1414,491 @@ mod tests {
         assert!(missing.error.as_deref().unwrap().contains("404"));
         let locked = reports.iter().find(|r| r.repo == "o/locked").unwrap();
         assert!(locked.error.as_deref().unwrap().contains("403"));
+    }
+
+    // --- Run & failure-detail collection (Phase 4) ----------------------
+
+    /// A full, well-formed workflow run with the given id and conclusion.
+    fn run_json(id: u64, conclusion: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": "CI",
+            "display_title": "Tidy up the build",
+            "run_number": id,
+            "event": "push",
+            "head_branch": "main",
+            "head_sha": "abcdef1234567890deadbeef",
+            "conclusion": conclusion,
+            "html_url": format!("https://github.com/o/r/actions/runs/{id}"),
+            "created_at": "2026-06-29T11:50:00Z",
+            "updated_at": "2026-06-29T11:52:30Z",
+        })
+    }
+
+    /// The runs-listing envelope around a set of runs.
+    fn runs_body(runs: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "total_count": runs.len(), "workflow_runs": runs })
+    }
+
+    /// A job with the given name/conclusion and explicit steps.
+    fn job_json(
+        name: &str,
+        conclusion: &str,
+        steps: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "conclusion": conclusion,
+            "html_url": format!("https://github.com/o/r/jobs/{name}"),
+            "steps": steps,
+        })
+    }
+
+    /// A single step record.
+    fn step_json(
+        number: u64,
+        name: &str,
+        conclusion: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({ "number": number, "name": name, "conclusion": conclusion })
+    }
+
+    /// The jobs-listing envelope around a set of jobs.
+    fn jobs_body(jobs: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "total_count": jobs.len(), "jobs": jobs })
+    }
+
+    /// Mount a runs-listing response for `owner/name`.
+    async fn mount_runs(
+        server: &MockServer,
+        owner: &str,
+        name: &str,
+        body: serde_json::Value,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{owner}/{name}/actions/runs")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a jobs-listing response for a specific run id.
+    async fn mount_jobs(
+        server: &MockServer,
+        owner: &str,
+        name: &str,
+        run_id: u64,
+        body: serde_json::Value,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/{owner}/{name}/actions/runs/{run_id}/jobs"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    // --- Pure normalization ---------------------------------------------
+
+    #[test]
+    fn normalize_run_shortens_sha_and_maps_fields() {
+        let (id, run) = normalize_run(ApiRun {
+            id: 7,
+            name: Some("CI".into()),
+            display_title: Some("Fix it".into()),
+            run_number: 42,
+            event: Some("pull_request".into()),
+            head_branch: Some("feature/x".into()),
+            head_sha: Some("abcdef1234567890".into()),
+            conclusion: Some("success".into()),
+            html_url: Some("https://example/run".into()),
+            created_at: Some("2026-06-29T11:50:00Z".into()),
+            updated_at: Some("2026-06-29T11:52:30Z".into()),
+        });
+        assert_eq!(id, 7);
+        assert_eq!(run.workflow, "CI");
+        assert_eq!(run.branch, "feature/x");
+        assert_eq!(run.sha, "abcdef1", "head SHA is shortened to 7 chars");
+        assert_eq!(run.run_number, 42);
+        assert_eq!(run.conclusion, Conclusion::Success);
+        assert!(run.jobs.is_empty());
+    }
+
+    #[test]
+    fn normalize_job_drops_passing_jobs_and_passing_steps() {
+        // A passing job is not a problem and is dropped entirely.
+        assert!(normalize_job(ApiJob {
+            name: Some("build".into()),
+            conclusion: Some("success".into()),
+            html_url: None,
+            steps: vec![],
+        })
+        .is_none());
+
+        // A failed job keeps only its actionable (non-passing/non-skipped)
+        // steps.
+        let job = normalize_job(ApiJob {
+            name: Some("test".into()),
+            conclusion: Some("failure".into()),
+            html_url: Some("https://example/job".into()),
+            steps: vec![
+                ApiStep {
+                    name: Some("Checkout".into()),
+                    number: 1,
+                    conclusion: Some("success".into()),
+                },
+                ApiStep {
+                    name: Some("Run tests".into()),
+                    number: 5,
+                    conclusion: Some("failure".into()),
+                },
+                ApiStep {
+                    name: Some("Upload".into()),
+                    number: 6,
+                    conclusion: Some("skipped".into()),
+                },
+            ],
+        })
+        .expect("a failed job is kept");
+        assert_eq!(job.name, "test");
+        assert_eq!(job.steps.len(), 1, "only the failed step survives");
+        assert_eq!(job.steps[0].name, "Run tests");
+        assert_eq!(job.steps[0].number, 5);
+    }
+
+    #[test]
+    fn is_problem_excludes_success_skipped_neutral() {
+        assert!(!is_problem(Conclusion::Success));
+        assert!(!is_problem(Conclusion::Skipped));
+        assert!(!is_problem(Conclusion::Neutral));
+        for c in [
+            Conclusion::Failure,
+            Conclusion::Cancelled,
+            Conclusion::TimedOut,
+            Conclusion::ActionRequired,
+            Conclusion::StartupFailure,
+            Conclusion::Stale,
+        ] {
+            assert!(is_problem(c), "{c:?} is an actionable problem");
+        }
+    }
+
+    // --- Completed-run fetch (mocked HTTP) ------------------------------
+
+    #[tokio::test]
+    async fn passing_run_is_one_line_with_no_jobs_request() {
+        let server = MockServer::start().await;
+        mount_runs(&server, "o", "r", runs_body(vec![run_json(1, "success")]))
+            .await;
+        // Deliberately mount NO jobs endpoint: a successful run must not trigger
+        // one, so collection still succeeds.
+
+        let client = test_client(&server.uri());
+        let runs = client.collect_runs(&repo("o", "r"), 1).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].is_success());
+        assert!(
+            runs[0].jobs.is_empty(),
+            "passing runs carry no job expansion"
+        );
+
+        // Prove the jobs endpoint was never called.
+        let hit_jobs = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path().contains("/jobs"));
+        assert!(!hit_jobs, "no jobs request for a successful run");
+    }
+
+    #[tokio::test]
+    async fn failed_run_is_enriched_with_failed_jobs_and_steps() {
+        let server = MockServer::start().await;
+        mount_runs(&server, "o", "r", runs_body(vec![run_json(2, "failure")]))
+            .await;
+        mount_jobs(
+            &server,
+            "o",
+            "r",
+            2,
+            jobs_body(vec![
+                // A passing job must be dropped from the failure detail.
+                job_json("build", "success", vec![]),
+                // The failed job is kept, with only its failed step.
+                job_json(
+                    "test (3.14)",
+                    "failure",
+                    vec![
+                        step_json(1, "Checkout", "success"),
+                        step_json(7, "Run tests", "failure"),
+                        step_json(8, "Coverage", "skipped"),
+                    ],
+                ),
+            ]),
+        )
+        .await;
+
+        let client = test_client(&server.uri());
+        let runs = client.collect_runs(&repo("o", "r"), 1).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run.conclusion, Conclusion::Failure);
+        assert_eq!(
+            run.jobs.len(),
+            1,
+            "only the non-successful job is attached"
+        );
+        let job = &run.jobs[0];
+        assert_eq!(job.name, "test (3.14)");
+        assert_eq!(job.conclusion, Conclusion::Failure);
+        assert!(job.url.contains("/jobs/"), "job URL preserved");
+        assert_eq!(job.steps.len(), 1, "only the failed step is attached");
+        assert_eq!(job.steps[0].name, "Run tests");
+        assert_eq!(job.steps[0].number, 7);
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_timed_out_runs_are_non_success_and_enriched() {
+        let server = MockServer::start().await;
+        mount_runs(
+            &server,
+            "o",
+            "r",
+            runs_body(vec![
+                run_json(1, "success"),
+                run_json(2, "cancelled"),
+                run_json(3, "timed_out"),
+            ]),
+        )
+        .await;
+        // Only the two unhealthy runs get a jobs request (id 1 is successful).
+        mount_jobs(
+            &server,
+            "o",
+            "r",
+            2,
+            jobs_body(vec![job_json("deploy", "cancelled", vec![])]),
+        )
+        .await;
+        mount_jobs(
+            &server,
+            "o",
+            "r",
+            3,
+            jobs_body(vec![job_json(
+                "integration",
+                "timed_out",
+                vec![step_json(4, "Wait for service", "timed_out")],
+            )]),
+        )
+        .await;
+
+        let client = test_client(&server.uri());
+        let runs = client.collect_runs(&repo("o", "r"), 3).await.unwrap();
+        assert_eq!(runs.len(), 3, "limit is per-repository");
+
+        let by_number =
+            |n: u64| runs.iter().find(|r| r.run_number == n).unwrap();
+        assert!(by_number(1).is_success());
+        assert!(by_number(1).jobs.is_empty());
+
+        let cancelled = by_number(2);
+        assert_eq!(cancelled.conclusion, Conclusion::Cancelled);
+        assert_eq!(cancelled.jobs.len(), 1);
+
+        let timed_out = by_number(3);
+        assert_eq!(timed_out.conclusion, Conclusion::TimedOut);
+        assert_eq!(timed_out.jobs[0].steps[0].conclusion, Conclusion::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn no_completed_runs_is_a_neutral_empty_report() {
+        let server = MockServer::start().await;
+        mount_runs(&server, "o", "empty", runs_body(vec![])).await;
+
+        let client = test_client(&server.uri());
+        let reports =
+            collect_repo_reports(&client, vec![repo("o", "empty")], 1, 8).await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].repo, "o/empty");
+        assert!(
+            reports[0].runs.is_empty(),
+            "no runs is a valid neutral state"
+        );
+        assert!(reports[0].error.is_none(), "empty is not an error");
+    }
+
+    #[tokio::test]
+    async fn malformed_run_payload_degrades_to_defaults() {
+        let server = MockServer::start().await;
+        // A partial run: only an id and a (passing) conclusion; every other
+        // field is absent. It must not fail the repo.
+        mount_runs(
+            &server,
+            "o",
+            "r",
+            serde_json::json!({
+                "workflow_runs": [ { "id": 99, "conclusion": "success" } ]
+            }),
+        )
+        .await;
+
+        let client = test_client(&server.uri());
+        let runs = client
+            .list_completed_runs(&repo("o", "r"), 1)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run.conclusion, Conclusion::Success);
+        assert_eq!(run.workflow, "", "missing fields default cleanly");
+        assert_eq!(run.branch, "");
+        assert_eq!(run.sha, "");
+        assert_eq!(run.run_number, 0);
+        assert!(run.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_completed_runs_sends_status_and_per_page() {
+        let server = MockServer::start().await;
+        // The request must carry status=completed and per_page == the limit.
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/actions/runs"))
+            .and(query_param("status", "completed"))
+            .and(query_param("per_page", "3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(runs_body(vec![run_json(1, "success")])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let runs = client
+            .list_completed_runs(&repo("o", "r"), 3)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        // The `.expect(1)` on the mock asserts the query was exactly right.
+    }
+
+    #[tokio::test]
+    async fn list_run_jobs_keeps_only_failed_jobs_and_failed_steps() {
+        let server = MockServer::start().await;
+        mount_jobs(
+            &server,
+            "o",
+            "r",
+            5,
+            jobs_body(vec![
+                job_json("lint", "success", vec![]),
+                job_json("skipped-job", "skipped", vec![]),
+                job_json(
+                    "test",
+                    "failure",
+                    vec![
+                        step_json(1, "Setup", "success"),
+                        step_json(2, "Test", "failure"),
+                    ],
+                ),
+            ]),
+        )
+        .await;
+
+        let client = test_client(&server.uri());
+        let jobs = client.list_run_jobs(&repo("o", "r"), 5).await.unwrap();
+        assert_eq!(jobs.len(), 1, "only the failed job is kept");
+        assert_eq!(jobs[0].name, "test");
+        assert_eq!(jobs[0].steps.len(), 1);
+        assert_eq!(jobs[0].steps[0].name, "Test");
+    }
+
+    // --- End-to-end collection → stable JSON ----------------------------
+
+    #[tokio::test]
+    async fn collect_repo_reports_renders_stable_json() {
+        let server = MockServer::start().await;
+        // A passing repo and a failing repo, fanned out together.
+        mount_runs(
+            &server,
+            "o",
+            "pass",
+            runs_body(vec![run_json(1, "success")]),
+        )
+        .await;
+        mount_runs(
+            &server,
+            "o",
+            "fail",
+            runs_body(vec![run_json(2, "failure")]),
+        )
+        .await;
+        mount_jobs(
+            &server,
+            "o",
+            "fail",
+            2,
+            jobs_body(vec![job_json(
+                "test",
+                "failure",
+                vec![step_json(3, "Run tests", "failure")],
+            )]),
+        )
+        .await;
+
+        let client = test_client(&server.uri());
+        let repos = collect_repo_reports(
+            &client,
+            vec![repo("o", "fail"), repo("o", "pass")],
+            1,
+            8,
+        )
+        .await;
+
+        // Build a Report (deterministic metadata) and render JSON.
+        let report = crate::model::Report {
+            generated_at: "2026-06-29T12:00:00Z".to_string(),
+            limit: 1,
+            repos,
+        };
+        let rendered = crate::render::json(&report);
+        let value: serde_json::Value = serde_json::from_str(&rendered)
+            .expect("collection renders valid JSON");
+
+        let repos = value["repositories"].as_array().unwrap();
+        assert_eq!(repos.len(), 2);
+        // Sorted by owner/name: "o/fail" before "o/pass".
+        assert_eq!(repos[0]["repo"], "o/fail");
+        assert_eq!(repos[1]["repo"], "o/pass");
+
+        // Passing repo: one passing run, no job expansion.
+        let pass_run = &repos[1]["runs"][0];
+        assert_eq!(pass_run["conclusion"], "success");
+        assert_eq!(pass_run["jobs"].as_array().unwrap().len(), 0);
+
+        // Failing repo: failed job + failed step with URLs preserved.
+        let fail_run = &repos[0]["runs"][0];
+        assert_eq!(fail_run["conclusion"], "failure");
+        assert_eq!(fail_run["jobs"][0]["name"], "test");
+        assert_eq!(fail_run["jobs"][0]["steps"][0]["name"], "Run tests");
+        assert!(report_has_failures(&value));
+    }
+
+    /// Tiny helper mirroring `Report::has_failures` over the rendered JSON.
+    fn report_has_failures(value: &serde_json::Value) -> bool {
+        value["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|repo| {
+                repo["runs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|run| run["conclusion"] != "success")
+            })
     }
 }

@@ -142,6 +142,29 @@ impl Conclusion {
             Conclusion::Skipped | Conclusion::Neutral => "•",
         }
     }
+
+    /// Parse a GitHub `conclusion` string (from a run, job, or step) into a
+    /// [`Conclusion`]. This is the inverse of [`Conclusion::label`].
+    ///
+    /// An unknown or absent (`null`) conclusion maps to [`Conclusion::Failure`]
+    /// so anything unexpected is surfaced loudly rather than silently treated as
+    /// a pass. In practice a `status=completed` run always carries a known
+    /// conclusion; the fallback only guards against malformed payloads or a new
+    /// conclusion GitHub adds in the future.
+    pub fn from_github(value: Option<&str>) -> Conclusion {
+        match value {
+            Some("success") => Conclusion::Success,
+            Some("failure") => Conclusion::Failure,
+            Some("cancelled") => Conclusion::Cancelled,
+            Some("timed_out") => Conclusion::TimedOut,
+            Some("action_required") => Conclusion::ActionRequired,
+            Some("startup_failure") => Conclusion::StartupFailure,
+            Some("skipped") => Conclusion::Skipped,
+            Some("neutral") => Conclusion::Neutral,
+            Some("stale") => Conclusion::Stale,
+            _ => Conclusion::Failure,
+        }
+    }
 }
 
 impl RunReport {
@@ -232,5 +255,43 @@ impl Report {
                 },
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_github_round_trips_every_known_conclusion() {
+        for c in [
+            Conclusion::Success,
+            Conclusion::Failure,
+            Conclusion::Cancelled,
+            Conclusion::TimedOut,
+            Conclusion::ActionRequired,
+            Conclusion::StartupFailure,
+            Conclusion::Skipped,
+            Conclusion::Neutral,
+            Conclusion::Stale,
+        ] {
+            assert_eq!(
+                Conclusion::from_github(Some(c.label())),
+                c,
+                "label() and from_github() must be inverses for {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_github_maps_unknown_and_missing_to_failure() {
+        // Anything unrecognized or absent is treated as a (loud) failure rather
+        // than silently passing.
+        assert_eq!(
+            Conclusion::from_github(Some("brand_new_thing")),
+            Conclusion::Failure
+        );
+        assert_eq!(Conclusion::from_github(None), Conclusion::Failure);
+        assert!(!Conclusion::from_github(None).is_success());
     }
 }
