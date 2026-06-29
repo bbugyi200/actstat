@@ -627,6 +627,8 @@ struct ApiRun {
     #[serde(default)]
     created_at: Option<String>,
     #[serde(default)]
+    run_started_at: Option<String>,
+    #[serde(default)]
     updated_at: Option<String>,
 }
 
@@ -667,6 +669,11 @@ struct ApiStep {
 fn normalize_run(api: ApiRun) -> (u64, RunReport) {
     let sha: String =
         api.head_sha.unwrap_or_default().chars().take(7).collect();
+    let duration_seconds = compute_duration_seconds(
+        api.run_started_at.as_deref(),
+        api.created_at.as_deref(),
+        api.updated_at.as_deref(),
+    );
     let report = RunReport {
         workflow: api.name.unwrap_or_default(),
         title: api.display_title.unwrap_or_default(),
@@ -678,9 +685,28 @@ fn normalize_run(api: ApiRun) -> (u64, RunReport) {
         url: api.html_url.unwrap_or_default(),
         created_at: api.created_at.unwrap_or_default(),
         updated_at: api.updated_at.unwrap_or_default(),
+        duration_seconds,
         jobs: vec![],
     };
     (api.id, report)
+}
+
+/// Compute a workflow run's wall-clock duration in seconds.
+///
+/// The start timestamp is `run_started_at` when present, falling back to
+/// `created_at` when it is absent; the end is `updated_at` (the run's final
+/// update, i.e. when it finished). Returns `None` when the selected start or the
+/// end timestamp is missing or unparseable, so a duration is only ever reported
+/// when it can be computed honestly. A negative span (clock skew between the two
+/// timestamps) is clamped to `0` so the result is always non-negative.
+fn compute_duration_seconds(
+    run_started_at: Option<&str>,
+    created_at: Option<&str>,
+    updated_at: Option<&str>,
+) -> Option<u64> {
+    let start: jiff::Timestamp = run_started_at.or(created_at)?.parse().ok()?;
+    let end: jiff::Timestamp = updated_at?.parse().ok()?;
+    Some((end.as_second() - start.as_second()).max(0) as u64)
 }
 
 /// Normalize one API job into a [`JobReport`], or `None` if the job is not an
@@ -1514,6 +1540,7 @@ mod tests {
             conclusion: Some("success".into()),
             html_url: Some("https://example/run".into()),
             created_at: Some("2026-06-29T11:50:00Z".into()),
+            run_started_at: None,
             updated_at: Some("2026-06-29T11:52:30Z".into()),
         });
         assert_eq!(id, 7);
@@ -1522,7 +1549,79 @@ mod tests {
         assert_eq!(run.sha, "abcdef1", "head SHA is shortened to 7 chars");
         assert_eq!(run.run_number, 42);
         assert_eq!(run.conclusion, Conclusion::Success);
+        // With no run_started_at, duration falls back to created_at → updated_at
+        // (11:50:00 → 11:52:30 = 150s).
+        assert_eq!(run.duration_seconds, Some(150));
         assert!(run.jobs.is_empty());
+    }
+
+    #[test]
+    fn compute_duration_prefers_run_started_at() {
+        // run_started_at (11:51:00) is used over created_at (11:50:00):
+        // 11:51:00 → 11:52:30 = 90s.
+        let secs = compute_duration_seconds(
+            Some("2026-06-29T11:51:00Z"),
+            Some("2026-06-29T11:50:00Z"),
+            Some("2026-06-29T11:52:30Z"),
+        );
+        assert_eq!(secs, Some(90));
+    }
+
+    #[test]
+    fn compute_duration_falls_back_to_created_at() {
+        // Absent run_started_at → created_at is the start (11:50:00 → 11:52:30).
+        let secs = compute_duration_seconds(
+            None,
+            Some("2026-06-29T11:50:00Z"),
+            Some("2026-06-29T11:52:30Z"),
+        );
+        assert_eq!(secs, Some(150));
+    }
+
+    #[test]
+    fn compute_duration_is_none_when_timestamps_missing() {
+        // No start at all.
+        assert_eq!(
+            compute_duration_seconds(None, None, Some("2026-06-29T11:52:30Z")),
+            None
+        );
+        // No end.
+        assert_eq!(
+            compute_duration_seconds(Some("2026-06-29T11:50:00Z"), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn compute_duration_is_none_for_malformed_timestamps() {
+        // An unparseable start or end yields no duration rather than a guess.
+        assert_eq!(
+            compute_duration_seconds(
+                Some("not-a-time"),
+                None,
+                Some("2026-06-29T11:52:30Z")
+            ),
+            None
+        );
+        assert_eq!(
+            compute_duration_seconds(
+                Some("2026-06-29T11:50:00Z"),
+                None,
+                Some("nonsense")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn compute_duration_clamps_negative_span_to_zero() {
+        // updated_at before the start (clock skew) clamps to 0, never negative.
+        let secs = compute_duration_seconds(
+            Some("2026-06-29T11:52:30Z"),
+            None,
+            Some("2026-06-29T11:50:00Z"),
+        );
+        assert_eq!(secs, Some(0));
     }
 
     #[test]

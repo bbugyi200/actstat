@@ -125,12 +125,15 @@ fn render_run(
     let dim = Style::new().dimmed();
 
     // Compact metadata trailing the workflow name: branch (when known), run
-    // number, and relative completion time.
+    // number, how long the run took (when known), and relative completion time.
     let mut meta: Vec<String> = Vec::new();
     if !run.branch.is_empty() {
         meta.push(run.branch.clone());
     }
     meta.push(format!("#{}", run.run_number));
+    if let Some(secs) = run.duration_seconds {
+        meta.push(humanize_duration(secs));
+    }
     if let Some(rel) = relative_time(&run.updated_at, generated_at) {
         meta.push(rel);
     }
@@ -239,6 +242,22 @@ fn humanize_ago(secs: i64) -> String {
         (secs / YEAR, "y")
     };
     format!("{n}{unit} ago")
+}
+
+/// Format a run's wall-clock duration compactly, using the two largest sensible
+/// units so it stays short: `45s`, `2m30s`, `1h5m`. Unlike [`humanize_ago`] this
+/// carries no "ago" suffix, so a duration token reads distinctly from the
+/// relative completion time it sits beside.
+fn humanize_duration(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    if secs < MIN {
+        format!("{secs}s")
+    } else if secs < HOUR {
+        format!("{}m{}s", secs / MIN, secs % MIN)
+    } else {
+        format!("{}h{}m", secs / HOUR, (secs % HOUR) / MIN)
+    }
 }
 
 /// Render the report as a single pretty-printed JSON document.
@@ -420,10 +439,10 @@ mod tests {
         let report = Report::stub(1);
         let expected = "\
 bbugyi200/actstat
-  ✔ CI · master · #42 · 7m ago
+  ✔ CI · master · #42 · 2m30s · 7m ago
 
 bbugyi200/dotfiles
-  ✘ CI · feature/shell · #128 · 15m ago · failure
+  ✘ CI · feature/shell · #128 · 4m10s · 15m ago · failure
       ✘ test (3.14)
           step 5: Run tests
           https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003
@@ -447,6 +466,25 @@ bbugyi200/dotfiles
         assert_eq!(humanize_ago(10 * 86400), "1w ago");
         assert_eq!(humanize_ago(45 * 86400), "1mo ago");
         assert_eq!(humanize_ago(400 * 86400), "1y ago");
+    }
+
+    #[test]
+    fn humanize_duration_uses_two_compact_units() {
+        assert_eq!(humanize_duration(0), "0s");
+        assert_eq!(humanize_duration(45), "45s");
+        assert_eq!(humanize_duration(150), "2m30s");
+        assert_eq!(humanize_duration(250), "4m10s");
+        assert_eq!(humanize_duration(120), "2m0s");
+        assert_eq!(humanize_duration(3905), "1h5m");
+    }
+
+    #[test]
+    fn human_run_line_shows_duration() {
+        // Stub durations: actstat ran 150s (2m30s), dotfiles 250s (4m10s).
+        let report = Report::stub(1);
+        let out = human(&report, false, false);
+        assert!(out.contains("2m30s"), "passing run shows its duration");
+        assert!(out.contains("4m10s"), "failing run shows its duration");
     }
 
     #[test]

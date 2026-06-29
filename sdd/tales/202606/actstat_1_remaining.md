@@ -1,6 +1,6 @@
 ---
 create_time: 2026-06-29 08:48:50
-status: wip
+status: done
 prompt: sdd/prompts/202606/actstat_1_remaining.md
 ---
 # Remaining Work Plan: actstat-1

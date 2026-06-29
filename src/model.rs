@@ -57,6 +57,11 @@ pub struct RunReport {
     pub created_at: String,
     /// When the run last updated, i.e. finished (RFC3339).
     pub updated_at: String,
+    /// Wall-clock duration of the run in seconds (start → finish). `None` when
+    /// the GitHub timestamps it is computed from are absent or malformed, so the
+    /// field is simply omitted rather than reported as a misleading zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
     /// Only *non-successful* jobs are attached; empty for passing runs.
     pub jobs: Vec<JobReport>,
 }
@@ -212,6 +217,8 @@ impl Report {
                         url: "https://github.com/bbugyi200/actstat/actions/runs/1001".to_string(),
                         created_at: "2026-06-29T11:50:00Z".to_string(),
                         updated_at: "2026-06-29T11:52:30Z".to_string(),
+                        // 11:50:00 → 11:52:30 = 150s.
+                        duration_seconds: Some(150),
                         jobs: vec![],
                     }],
                     error: None,
@@ -229,6 +236,8 @@ impl Report {
                         url: "https://github.com/bbugyi200/dotfiles/actions/runs/2002".to_string(),
                         created_at: "2026-06-29T11:40:00Z".to_string(),
                         updated_at: "2026-06-29T11:44:10Z".to_string(),
+                        // 11:40:00 → 11:44:10 = 250s.
+                        duration_seconds: Some(250),
                         jobs: vec![JobReport {
                             name: "test (3.14)".to_string(),
                             conclusion: Conclusion::Failure,

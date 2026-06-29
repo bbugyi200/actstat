@@ -167,17 +167,18 @@ actstat --fail-on-failure -q         # quiet gate for cron/CI (see exit codes be
 
 Repositories are grouped and sorted alphabetically; runs are newest-completed
 first. A passing run is one compact line (icon · workflow · branch · run number ·
-relative time). A non-successful run keeps that line, appends its conclusion
-label, and expands into the failed jobs, their failed steps, and direct GitHub
-URLs. A repository with no completed runs shows a neutral row; a repository that
-errored shows a clear error row — neither is ever silently dropped.
+duration · relative time). A non-successful run keeps that line, appends its
+conclusion label, and expands into the failed jobs, their failed steps, and
+direct GitHub URLs. A repository with no completed runs shows a neutral row; a
+repository that errored shows a clear error row — neither is ever silently
+dropped.
 
 ```text
 bbugyi200/actstat
-  ✔ CI · master · #42 · 7m ago
+  ✔ CI · master · #42 · 2m30s · 7m ago
 
 bbugyi200/dotfiles
-  ✘ CI · feature/shell · #128 · 15m ago · failure
+  ✘ CI · feature/shell · #128 · 4m10s · 15m ago · failure
       ✘ test (3.14)
           step 5: Run tests
           https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003
@@ -190,7 +191,8 @@ bbugyi200/dotfiles
 
 Reading the example:
 
-- `bbugyi200/actstat` — latest `CI` run on `master` (run `#42`) passed `7m ago`.
+- `bbugyi200/actstat` — latest `CI` run on `master` (run `#42`) ran for `2m30s`
+  and passed `7m ago`.
 - `bbugyi200/dotfiles` — latest `CI` run **failed**; the failed job `test (3.14)`
   failed at `step 5: Run tests`, with links straight to the job log and the run.
 - `sase-org/example` — neutral: no completed runs to report.
@@ -227,6 +229,7 @@ deterministic for deterministic input.
           "url": "https://github.com/bbugyi200/actstat/actions/runs/1001",
           "created_at": "2026-06-29T11:50:00Z",
           "updated_at": "2026-06-29T11:52:30Z",
+          "duration_seconds": 150,
           "jobs": []
         }
       ]
@@ -245,6 +248,7 @@ deterministic for deterministic input.
           "url": "https://github.com/bbugyi200/dotfiles/actions/runs/2002",
           "created_at": "2026-06-29T11:40:00Z",
           "updated_at": "2026-06-29T11:44:10Z",
+          "duration_seconds": 250,
           "jobs": [
             {
               "name": "test (3.14)",
@@ -282,8 +286,8 @@ One JSON record per line for easy `jq`/shell piping. Every line carries a `type`
 inspected run, plus one `repo_error` record per errored repository.
 
 ```jsonl
-{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:50:00Z","event":"push","jobs":[],"repo":"bbugyi200/actstat","run_number":42,"sha":"a1b2c3d","title":"Add list subcommand","type":"run","updated_at":"2026-06-29T11:52:30Z","url":"https://github.com/bbugyi200/actstat/actions/runs/1001","workflow":"CI"}
-{"branch":"feature/shell","conclusion":"failure","created_at":"2026-06-29T11:40:00Z","event":"pull_request","jobs":[{"conclusion":"failure","name":"test (3.14)","steps":[{"conclusion":"failure","name":"Run tests","number":5}],"url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003"}],"repo":"bbugyi200/dotfiles","run_number":128,"sha":"9f8e7d6","title":"Refactor shell init","type":"run","updated_at":"2026-06-29T11:44:10Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002","workflow":"CI"}
+{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:50:00Z","duration_seconds":150,"event":"push","jobs":[],"repo":"bbugyi200/actstat","run_number":42,"sha":"a1b2c3d","title":"Add list subcommand","type":"run","updated_at":"2026-06-29T11:52:30Z","url":"https://github.com/bbugyi200/actstat/actions/runs/1001","workflow":"CI"}
+{"branch":"feature/shell","conclusion":"failure","created_at":"2026-06-29T11:40:00Z","duration_seconds":250,"event":"pull_request","jobs":[{"conclusion":"failure","name":"test (3.14)","steps":[{"conclusion":"failure","name":"Run tests","number":5}],"url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003"}],"repo":"bbugyi200/dotfiles","run_number":128,"sha":"9f8e7d6","title":"Refactor shell init","type":"run","updated_at":"2026-06-29T11:44:10Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002","workflow":"CI"}
 {"error":"403 Forbidden (token lacks access)","repo":"bobs-org/locked","type":"repo_error"}
 ```
 
