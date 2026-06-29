@@ -64,7 +64,9 @@ single **repo** (`owner/name`):
 ```yaml
 # ~/.config/actstat/config.yml
 projects:
-  - org: sase-org # all repositories in the sase-org organization
+  - org: sase-org
+    exclude:
+      - sase-org/sase-android # include every sase-org repo except this one
   - org: bobs-org # all repositories in the bobs-org organization
   - repo: bbugyi200/dotfiles # a single repository
   - repo: bbugyi200/actstat # this repository
@@ -72,6 +74,16 @@ projects:
 
 All sources resolve into a de-duplicated, alphabetically sorted list of
 `owner/name`. A repository named both explicitly and via its org appears once.
+
+### Org filters
+
+An `org:` entry can refine how that organization's repositories are expanded:
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `exclude` | List of `owner/name` repos to drop from that org's expansion. Owners must match the org. This does not block an explicit `repo:` entry for the same repository. | `[]` |
+| `include_archived` | Include archived repos in the org expansion. | `false` |
+| `include_forks` | Include forked repos in the org expansion. | `false` |
 
 ### Where the config is found
 

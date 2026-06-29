@@ -1,8 +1,8 @@
 //! Configuration model, discovery, parsing, validation, and source resolution.
 //!
 //! The config uses the user's own vocabulary (`projects`) and a small,
-//! forward-compatible shape. Each project entry is either an **org** (which
-//! expands to all of that organization's repositories in Phase 3) or a single
+//! forward-compatible shape. Each project entry is either an **org** (expanded
+//! to that organization's repositories, with optional filters) or a single
 //! **repo**:
 //!
 //! ```yaml
@@ -21,8 +21,8 @@
 //! 3. **Validation** — turning the loose YAML into a checked [`Config`] with
 //!    clear, actionable errors.
 //! 4. **Resolution** — the pure merge/dedup/sort that combines explicitly
-//!    configured repos with (later, Phase 3) org-expanded repos into a single
-//!    de-duplicated, alphabetically-stable list of `owner/name`.
+//!    configured repos with org-expanded repos into a single de-duplicated,
+//!    alphabetically-stable list of `owner/name`.
 //!
 //! No secrets ever live in the config; tokens come only from the environment or
 //! `gh` (see [`crate::github`]).
@@ -75,25 +75,22 @@ pub struct Config {
 /// One configured source of repositories: an entire org or a single repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectSource {
-    /// Every repository in an organization (expanded to concrete repos in
-    /// Phase 3). The reserved filters are parsed now for forward-compatibility.
+    /// Every repository in an organization, with supported expansion filters.
     Org(OrgSource),
     /// Exactly one repository.
     Repo(RepoName),
 }
 
-/// An organization source plus its (reserved, forward-compatible) filters.
+/// An organization source plus its expansion filters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgSource {
     /// Bare organization login (e.g. `sase-org`).
     pub org: String,
     /// Include archived repositories during expansion. Defaults to `false`.
-    /// Reserved for Phase 3 — parsed now so configs using it don't break.
     pub include_archived: bool,
-    /// Include forks during expansion. Defaults to `false`. Reserved for
-    /// Phase 3 — parsed now so configs using it don't break.
+    /// Include forks during expansion. Defaults to `false`.
     pub include_forks: bool,
-    /// Repositories to drop from this org's expansion. Reserved for Phase 3.
+    /// Repositories to drop from this org's expansion.
     pub exclude: Vec<RepoName>,
 }
 
@@ -189,9 +186,7 @@ impl Config {
 /// Merge explicitly-configured repos with org-expanded repos into the final
 /// de-duplicated, alphabetically-stable list of `owner/name`.
 ///
-/// Org expansion (the network call) lands in Phase 3; this pure
-/// merge/dedup/sort is the stable core both the config and the GitHub client
-/// build on. A repo named both explicitly and via its org appears exactly once.
+/// A repo named both explicitly and via its org appears exactly once.
 pub fn resolve_repos(
     explicit: impl IntoIterator<Item = RepoName>,
     expanded: impl IntoIterator<Item = RepoName>,
@@ -308,7 +303,7 @@ struct RawConfig {
 }
 
 /// A single raw project entry. Unknown fields are intentionally **allowed** so
-/// future org filters can be added without breaking older binaries.
+/// future config fields can be added without breaking older binaries.
 #[derive(Debug, Deserialize)]
 struct RawProject {
     #[serde(default)]
@@ -365,6 +360,13 @@ fn validate(raw: RawConfig, path: &str) -> Result<Config, ConfigError> {
                 path,
             )?),
             (None, Some(repo)) => {
+                validate_repo_entry_fields(
+                    &rp.exclude,
+                    rp.include_archived,
+                    rp.include_forks,
+                    n,
+                    path,
+                )?;
                 let name = RepoName::parse(&repo)
                     .map_err(|e| invalid(path, format!("project #{n}: {e}")))?;
                 ProjectSource::Repo(name)
@@ -376,7 +378,37 @@ fn validate(raw: RawConfig, path: &str) -> Result<Config, ConfigError> {
     Ok(Config { projects })
 }
 
-/// Validate a single org entry and its reserved filters.
+/// Validate a single repo entry's org-only fields.
+fn validate_repo_entry_fields(
+    exclude: &Option<Vec<String>>,
+    include_archived: Option<bool>,
+    include_forks: Option<bool>,
+    n: usize,
+    path: &str,
+) -> Result<(), ConfigError> {
+    if exclude.is_some() {
+        return Err(org_only_field_error(path, n, "exclude"));
+    }
+    if include_archived.is_some() {
+        return Err(org_only_field_error(path, n, "include_archived"));
+    }
+    if include_forks.is_some() {
+        return Err(org_only_field_error(path, n, "include_forks"));
+    }
+    Ok(())
+}
+
+/// Build the shared error for a known org-only key used on a repo entry.
+fn org_only_field_error(path: &str, n: usize, field: &str) -> ConfigError {
+    invalid(
+        path,
+        format!(
+            "project #{n}: `{field}` only applies to `org:` entries, not `repo:`"
+        ),
+    )
+}
+
+/// Validate a single org entry and its filters.
 fn validate_org(
     org: String,
     exclude: &Option<Vec<String>>,
@@ -406,6 +438,14 @@ fn validate_org(
         let name = RepoName::parse(entry).map_err(|e| {
             invalid(path, format!("project #{n} `exclude`: {e}"))
         })?;
+        if !name.owner.eq_ignore_ascii_case(org) {
+            return Err(invalid(
+                path,
+                format!(
+                    "project #{n} `exclude`: `{name}` is not in org `{org}`"
+                ),
+            ));
+        }
         excluded.push(name);
     }
 
@@ -478,7 +518,7 @@ projects:
     }
 
     #[test]
-    fn org_entry_defaults_reserved_filters() {
+    fn org_entry_defaults_filters() {
         let cfg = parse_str("projects:\n  - org: sase-org\n", "<t>").unwrap();
         let org = cfg.orgs().next().unwrap();
         assert_eq!(org.org, "sase-org");
@@ -488,7 +528,7 @@ projects:
     }
 
     #[test]
-    fn org_entry_parses_reserved_filters_forward_compatibly() {
+    fn org_entry_parses_org_filters() {
         let text = "\
 projects:
   - org: sase-org
@@ -496,7 +536,7 @@ projects:
     include_forks: true
     exclude: [sase-org/scratch, sase-org/old]
 ";
-        let cfg = parse_str(text, "<t>").expect("forward-compat fields parse");
+        let cfg = parse_str(text, "<t>").expect("org filters parse");
         let org = cfg.orgs().next().unwrap();
         assert!(org.include_archived);
         assert!(org.include_forks);
@@ -569,6 +609,22 @@ projects:
     }
 
     #[test]
+    fn repo_entry_rejects_org_only_fields() {
+        for (field, line) in [
+            ("exclude", "    exclude: [o/skip]\n"),
+            ("include_archived", "    include_archived: true\n"),
+            ("include_forks", "    include_forks: true\n"),
+        ] {
+            let text = format!("projects:\n  - repo: o/r\n{line}");
+            let err = parse_str(&text, "cfg.yml").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(field), "got: {msg}");
+            assert!(msg.contains("org:"), "got: {msg}");
+            assert!(msg.contains("repo:"), "got: {msg}");
+        }
+    }
+
+    #[test]
     fn org_containing_a_slash_is_an_error() {
         let err =
             parse_str("projects:\n  - org: a/b\n", "cfg.yml").unwrap_err();
@@ -584,6 +640,30 @@ projects:
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exclude"), "got: {msg}");
+    }
+
+    #[test]
+    fn exclude_entry_with_foreign_owner_is_an_error() {
+        let err = parse_str(
+            "projects:\n  - org: sase-org\n    exclude: [other-org/scratch]\n",
+            "cfg.yml",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exclude"), "got: {msg}");
+        assert!(msg.contains("other-org/scratch"), "got: {msg}");
+        assert!(msg.contains("sase-org"), "got: {msg}");
+    }
+
+    #[test]
+    fn exclude_owner_matching_org_with_different_case_is_allowed() {
+        let cfg = parse_str(
+            "projects:\n  - org: Sase-Org\n    exclude: [sase-org/scratch]\n",
+            "cfg.yml",
+        )
+        .expect("GitHub org names are case-insensitive");
+        let org = cfg.orgs().next().unwrap();
+        assert_eq!(org.exclude, vec![repo("sase-org", "scratch")]);
     }
 
     #[test]

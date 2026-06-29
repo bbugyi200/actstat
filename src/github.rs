@@ -14,9 +14,9 @@
 //!    transient failures and explicit mapping of `401`/`403`/`404`/rate-limit
 //!    statuses to typed [`GitHubError`]s.
 //! 3. [`GitHubClient::list_org_repos`] — expand one org into its repositories,
-//!    following pagination to exhaustion and honoring the reserved filters.
+//!    following pagination to exhaustion and honoring configured filters.
 //! 4. [`resolve_repositories`] — expand every configured org (bounded
-//!    concurrency), then merge with the explicit repos through Phase 2's
+//!    concurrency), then merge with the explicit repos through
 //!    [`resolve_repos`] into one de-duplicated, alphabetically-stable list.
 //! 5. [`GitHubClient::list_run_jobs`] — fetch failed jobs and steps for a
 //!    non-passing workflow run.
@@ -326,7 +326,7 @@ impl GitHubClient {
 
     /// Expand one org into its repositories.
     ///
-    /// Follows pagination to exhaustion and applies the org's reserved filters:
+    /// Follows pagination to exhaustion and applies the org's filters:
     /// archived and forked repos are dropped unless explicitly included, and any
     /// repo in `exclude` is removed. The result is the org's `owner/name`
     /// entries in API order (the caller's [`resolve_repos`] handles final
@@ -345,7 +345,11 @@ impl GitHubClient {
                 owner: r.owner.login,
                 name: r.name,
             })
-            .filter(|name| !org.exclude.contains(name))
+            .filter(|name| {
+                !org.exclude.iter().any(|excluded| {
+                    repo_name_eq_ignore_ascii_case(excluded, name)
+                })
+            })
             .collect())
     }
 
@@ -1029,8 +1033,8 @@ pub struct ResolvedRepos {
 }
 
 /// Expand every org in `config` (with bounded concurrency) and merge the
-/// results with the explicitly-listed repos through Phase 2's [`resolve_repos`],
-/// yielding one de-duplicated, sorted `owner/name` list.
+/// results with the explicitly-listed repos through [`resolve_repos`], yielding
+/// one de-duplicated, sorted `owner/name` list.
 ///
 /// A repo named both explicitly and via its org appears exactly once. Org
 /// expansion failures are collected into [`ResolvedRepos::org_errors`] rather
@@ -1107,6 +1111,12 @@ where
 
     reports.sort_by(|a, b| a.repo.cmp(&b.repo));
     reports
+}
+
+/// Case-insensitive repository comparison for GitHub-originated names.
+fn repo_name_eq_ignore_ascii_case(a: &RepoName, b: &RepoName) -> bool {
+    a.owner.eq_ignore_ascii_case(&b.owner)
+        && a.name.eq_ignore_ascii_case(&b.name)
 }
 
 /// The Phase 4 collection pipeline: fan out over `repos` (bounded by
@@ -1348,10 +1358,11 @@ mod tests {
             .await;
 
         let mut source = org("sase-org");
-        source.exclude = vec![repo("sase-org", "scratch")];
+        source.exclude = vec![repo("Sase-Org", "Scratch")];
         let client = test_client(&server.uri());
         let repos = client.list_org_repos(&source).await.unwrap();
-        // archived, fork, and excluded entries are dropped by default.
+        // archived, fork, and case-mismatched excluded entries are dropped by
+        // default.
         assert_eq!(repos, vec![repo("sase-org", "active")]);
     }
 

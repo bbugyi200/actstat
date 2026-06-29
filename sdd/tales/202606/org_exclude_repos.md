@@ -1,6 +1,6 @@
 ---
 create_time: 2026-06-29 12:53:42
-status: wip
+status: done
 prompt: sdd/prompts/202606/org_exclude_repos.md
 ---
 # Plan: First-class "exclude repos from an org" configuration
