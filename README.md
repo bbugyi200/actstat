@@ -1,13 +1,13 @@
 # actstat
 
-A fast, beautiful Rust CLI that reports the status of the most recent completed
-GitHub Actions workflow runs across a configured set of repositories.
+A fast, beautiful Rust CLI that reports the status of the most recent settled
+default-branch GitHub Actions commits across a configured set of repositories.
 
 `actstat` answers one question quickly: **which of my projects are healthy, and
-what broke most recently?** A passing run collapses to a single compact line; a
-failing run expands into the failed jobs and steps with direct links to the
-broken logs. Output is grouped by repository, quiet about success, and loud and
-detailed about failure.
+what broke most recently?** A green commit collapses to a single compact line; a
+red commit expands into every failed workflow run, failed job, and failed step
+with direct links to the broken logs. Output is grouped by repository, quiet
+about success, and loud and detailed about failure.
 
 It is built to be comfortable as an interactive terminal command **and**
 dependable inside cronjobs and scripts: async fan-out across repositories, a
@@ -17,8 +17,8 @@ broken repository never aborts the run), and stable machine-readable output
 
 ## Highlights
 
-- **Compact when healthy, detailed when not.** Passing runs are one line; failing
-  runs expand to failed jobs → failed steps → GitHub URLs.
+- **Compact when healthy, detailed when not.** Green commits are one line; red
+  commits expand to failed runs → failed jobs → failed steps → GitHub URLs.
 - **Resilient.** A repo with no access, disabled Actions, or a rate limit becomes
   an inline error row instead of crashing the run.
 - **Scriptable.** `--format json` / `--format jsonl` emit stable, deterministic
@@ -136,28 +136,28 @@ Running `actstat` with no subcommand behaves exactly like `actstat list`, and th
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `-n, --limit <N>` | Most-recent completed runs to inspect **per repository** (must be ≥ 1). | `1` |
+| `-n, --limit <N>` | Most-recent settled commits to inspect **per repository** (must be ≥ 1). | `1` |
 | `-f, --format <human\|json\|jsonl>` | Output format. | `human` |
 | `-c, --config <PATH>` | Explicit config path (overrides discovery). | discovery |
 | `--color <auto\|always\|never>` | Color control; also honors `NO_COLOR`. | `auto` |
-| `--only-failures` | Show only non-passing runs in **human** output. | off |
+| `--only-failures` | Show only red commits in **human** output. | off |
 | `--repo <OWNER/NAME>` | Restrict to a subset of configured repos (repeatable). | all |
 | `--concurrency <N>` | Max repositories fetched concurrently. | `8` |
-| `--fail-on-failure` | Exit non-zero if any inspected run is non-successful. | off |
+| `--fail-on-failure` | Exit non-zero if any inspected commit is red. | off |
 | `-v, --verbose` | Increase diagnostic verbosity (stderr only; repeatable). | off |
 | `-q, --quiet` | Suppress non-error diagnostics (stderr only). | off |
 
 `--only-failures` filters the **human** view only; `json` and `jsonl` always
-include every run so machine consumers can do their own filtering.
+include every shown commit so machine consumers can do their own filtering.
 
 ### Examples
 
 ```sh
-actstat                              # status of the latest run per configured repo
-actstat -n 5                         # inspect the 5 most recent completed runs each
+actstat                              # status of the latest settled commit per repo
+actstat -n 5                         # inspect the 5 most recent settled commits each
 actstat --only-failures              # show only what's broken
 actstat --repo bbugyi200/actstat     # just one repo, ignoring the rest of the config
-actstat -f json | jq '.repositories[] | select(.runs[].conclusion != "success")'
+actstat -f json | jq '.repositories[] | select(.commits[].conclusion != "success")'
 actstat --fail-on-failure -q         # quiet gate for cron/CI (see exit codes below)
 ```
 
@@ -165,37 +165,37 @@ actstat --fail-on-failure -q         # quiet gate for cron/CI (see exit codes be
 
 ### Human (default)
 
-Repositories are grouped and sorted alphabetically; runs are newest-completed
-first. A passing run is one compact line (icon · workflow · branch · run number ·
-duration · relative time). A non-successful run keeps that line, appends its
-conclusion label, and expands into the failed jobs, their failed steps, and
-direct GitHub URLs. A repository with no completed runs shows a neutral row; a
-repository that errored shows a clear error row — neither is ever silently
-dropped.
+Repositories are grouped and sorted alphabetically; commits are newest settled
+first on each repository's default branch. A green commit is one compact line
+(icon · short SHA · title · branch · duration · relative time). A red commit
+keeps that summary, appends its aggregate conclusion label, and expands into the
+failed workflow runs, their failed jobs, failed steps, and direct GitHub URLs.
+Repositories with no settled commits are omitted; repositories that error still
+show a clear error row.
 
 ```text
 bbugyi200/actstat
-  ✔ CI · master · #42 · 2m30s · 7m ago
+  ✔ a1b2c3d Add list subcommand · master · 2m30s · 7m ago
 
 bbugyi200/dotfiles
-  ✘ CI · feature/shell · #128 · 4m10s · 15m ago · failure
-      ✘ test (3.14)
-          step 5: Run tests
-          https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003
-      https://github.com/bbugyi200/dotfiles/actions/runs/2002
-
-• sase-org/example  no completed runs
+  ✘ 9f8e7d6 Refactor shell init · master · 2 workflows · 4m10s · 15m ago · failure
+      ✘ CI · #128 · 4m10s · failure
+          ✘ test (3.14)
+              step 5: Run tests
+              https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003
+          https://github.com/bbugyi200/dotfiles/actions/runs/2002
 
 ✘ bobs-org/locked  403 Forbidden (token lacks access)
 ```
 
 Reading the example:
 
-- `bbugyi200/actstat` — latest `CI` run on `master` (run `#42`) ran for `2m30s`
-  and passed `7m ago`.
-- `bbugyi200/dotfiles` — latest `CI` run **failed**; the failed job `test (3.14)`
-  failed at `step 5: Run tests`, with links straight to the job log and the run.
-- `sase-org/example` — neutral: no completed runs to report.
+- `bbugyi200/actstat` — latest settled `master` commit passed; its workflow
+  group took `2m30s` and finished `7m ago`.
+- `bbugyi200/dotfiles` — latest settled `master` commit is red because `CI`
+  failed; `Deploy Docs` passed on the same commit, so the commit shows
+  `2 workflows`. The failed job `test (3.14)` failed at `step 5: Run tests`,
+  with links straight to the job log and the run.
 - `bobs-org/locked` — an error row: the token can't access it.
 
 Color is adaptive: on by default when stdout is a TTY, off when piped, when
@@ -206,9 +206,9 @@ cleanly.
 ### JSON (`--format json`)
 
 A single pretty-printed document: top-level metadata plus a `repositories` array.
-Each repo carries its `runs` (and an `error` field only when it failed); each
-non-successful run carries its failed `jobs` and their failed `steps`. Output is
-deterministic for deterministic input.
+Each repo carries its `commits` (and an `error` field only when it failed); each
+commit carries its `runs`, and each problem run carries failed `jobs` and failed
+`steps`. Output is deterministic for deterministic input.
 
 ```json
 {
@@ -217,62 +217,96 @@ deterministic for deterministic input.
   "repositories": [
     {
       "repo": "bbugyi200/actstat",
-      "runs": [
+      "commits": [
         {
-          "workflow": "CI",
-          "title": "Add list subcommand",
-          "run_number": 42,
-          "event": "push",
-          "branch": "master",
           "sha": "a1b2c3d",
+          "title": "Add list subcommand",
+          "branch": "master",
+          "event": "push",
           "conclusion": "success",
-          "url": "https://github.com/bbugyi200/actstat/actions/runs/1001",
-          "created_at": "2026-06-29T11:50:00Z",
-          "updated_at": "2026-06-29T11:52:30Z",
+          "url": "https://github.com/bbugyi200/actstat/commit/a1b2c3d4e5f67890",
+          "finished_at": "2026-06-29T11:52:30Z",
           "duration_seconds": 150,
-          "jobs": []
-        }
-      ]
-    },
-    {
-      "repo": "bbugyi200/dotfiles",
-      "runs": [
-        {
-          "workflow": "CI",
-          "title": "Refactor shell init",
-          "run_number": 128,
-          "event": "pull_request",
-          "branch": "feature/shell",
-          "sha": "9f8e7d6",
-          "conclusion": "failure",
-          "url": "https://github.com/bbugyi200/dotfiles/actions/runs/2002",
-          "created_at": "2026-06-29T11:40:00Z",
-          "updated_at": "2026-06-29T11:44:10Z",
-          "duration_seconds": 250,
-          "jobs": [
+          "runs": [
             {
-              "name": "test (3.14)",
-              "conclusion": "failure",
-              "url": "https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003",
-              "steps": [
-                {
-                  "name": "Run tests",
-                  "number": 5,
-                  "conclusion": "failure"
-                }
-              ]
+              "workflow": "CI",
+              "title": "Add list subcommand",
+              "run_number": 42,
+              "event": "push",
+              "branch": "master",
+              "sha": "a1b2c3d",
+              "conclusion": "success",
+              "url": "https://github.com/bbugyi200/actstat/actions/runs/1001",
+              "created_at": "2026-06-29T11:50:00Z",
+              "updated_at": "2026-06-29T11:52:30Z",
+              "duration_seconds": 150,
+              "jobs": []
             }
           ]
         }
       ]
     },
     {
-      "repo": "sase-org/example",
-      "runs": []
+      "repo": "bbugyi200/dotfiles",
+      "commits": [
+        {
+          "sha": "9f8e7d6",
+          "title": "Refactor shell init",
+          "branch": "master",
+          "event": "push",
+          "conclusion": "failure",
+          "url": "https://github.com/bbugyi200/dotfiles/commit/9f8e7d6c5b4a3210",
+          "finished_at": "2026-06-29T11:44:10Z",
+          "duration_seconds": 250,
+          "runs": [
+            {
+              "workflow": "CI",
+              "title": "Refactor shell init",
+              "run_number": 128,
+              "event": "push",
+              "branch": "master",
+              "sha": "9f8e7d6",
+              "conclusion": "failure",
+              "url": "https://github.com/bbugyi200/dotfiles/actions/runs/2002",
+              "created_at": "2026-06-29T11:40:00Z",
+              "updated_at": "2026-06-29T11:44:10Z",
+              "duration_seconds": 250,
+              "jobs": [
+                {
+                  "name": "test (3.14)",
+                  "conclusion": "failure",
+                  "url": "https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003",
+                  "steps": [
+                    {
+                      "name": "Run tests",
+                      "number": 5,
+                      "conclusion": "failure"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "workflow": "Deploy Docs",
+              "title": "Refactor shell init",
+              "run_number": 33,
+              "event": "push",
+              "branch": "master",
+              "sha": "9f8e7d6",
+              "conclusion": "success",
+              "url": "https://github.com/bbugyi200/dotfiles/actions/runs/2003",
+              "created_at": "2026-06-29T11:41:00Z",
+              "updated_at": "2026-06-29T11:43:00Z",
+              "duration_seconds": 120,
+              "jobs": []
+            }
+          ]
+        }
+      ]
     },
     {
       "repo": "bobs-org/locked",
-      "runs": [],
+      "commits": [],
       "error": "403 Forbidden (token lacks access)"
     }
   ]
@@ -282,19 +316,19 @@ deterministic for deterministic input.
 ### JSONL (`--format jsonl`)
 
 One JSON record per line for easy `jq`/shell piping. Every line carries a `type`
-(`run` or `repo_error`) and the `repo` it belongs to: one `run` record per
-inspected run, plus one `repo_error` record per errored repository.
+(`commit` or `repo_error`) and the `repo` it belongs to: one `commit` record per
+shown commit, plus one `repo_error` record per errored repository.
 
 ```jsonl
-{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:50:00Z","duration_seconds":150,"event":"push","jobs":[],"repo":"bbugyi200/actstat","run_number":42,"sha":"a1b2c3d","title":"Add list subcommand","type":"run","updated_at":"2026-06-29T11:52:30Z","url":"https://github.com/bbugyi200/actstat/actions/runs/1001","workflow":"CI"}
-{"branch":"feature/shell","conclusion":"failure","created_at":"2026-06-29T11:40:00Z","duration_seconds":250,"event":"pull_request","jobs":[{"conclusion":"failure","name":"test (3.14)","steps":[{"conclusion":"failure","name":"Run tests","number":5}],"url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003"}],"repo":"bbugyi200/dotfiles","run_number":128,"sha":"9f8e7d6","title":"Refactor shell init","type":"run","updated_at":"2026-06-29T11:44:10Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002","workflow":"CI"}
+{"branch":"master","conclusion":"success","duration_seconds":150,"event":"push","finished_at":"2026-06-29T11:52:30Z","repo":"bbugyi200/actstat","runs":[{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:50:00Z","duration_seconds":150,"event":"push","jobs":[],"run_number":42,"sha":"a1b2c3d","title":"Add list subcommand","updated_at":"2026-06-29T11:52:30Z","url":"https://github.com/bbugyi200/actstat/actions/runs/1001","workflow":"CI"}],"sha":"a1b2c3d","title":"Add list subcommand","type":"commit","url":"https://github.com/bbugyi200/actstat/commit/a1b2c3d4e5f67890"}
+{"branch":"master","conclusion":"failure","duration_seconds":250,"event":"push","finished_at":"2026-06-29T11:44:10Z","repo":"bbugyi200/dotfiles","runs":[{"branch":"master","conclusion":"failure","created_at":"2026-06-29T11:40:00Z","duration_seconds":250,"event":"push","jobs":[{"conclusion":"failure","name":"test (3.14)","steps":[{"conclusion":"failure","name":"Run tests","number":5}],"url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003"}],"run_number":128,"sha":"9f8e7d6","title":"Refactor shell init","updated_at":"2026-06-29T11:44:10Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002","workflow":"CI"},{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:41:00Z","duration_seconds":120,"event":"push","jobs":[],"run_number":33,"sha":"9f8e7d6","title":"Refactor shell init","updated_at":"2026-06-29T11:43:00Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2003","workflow":"Deploy Docs"}],"sha":"9f8e7d6","title":"Refactor shell init","type":"commit","url":"https://github.com/bbugyi200/dotfiles/commit/9f8e7d6c5b4a3210"}
 {"error":"403 Forbidden (token lacks access)","repo":"bobs-org/locked","type":"repo_error"}
 ```
 
-For example, to list every repo with a failing latest run:
+For example, to list every repo with a red shown commit:
 
 ```sh
-actstat -f jsonl | jq -r 'select(.type=="run" and .conclusion!="success") | .repo'
+actstat -f jsonl | jq -r 'select(.type=="commit" and .conclusion!="success") | .repo'
 ```
 
 ## Exit codes
@@ -304,12 +338,12 @@ to **stderr**, so `actstat list -f json` is always pipe-clean.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Ran to completion. Run conclusions are reported, **not** gated — a red run alone does not change the exit code. |
+| `0` | Ran to completion. Commit conclusions are reported, **not** gated — a red commit alone does not change the exit code. |
 | `1` | Operational error: no usable config, config parse error, every inspected repository errored, or a fatal client/runtime error. |
-| `2` | `--fail-on-failure` is set and at least one inspected run was non-successful. Also returned for a usage error such as a malformed `--repo OWNER/NAME` value. |
+| `2` | `--fail-on-failure` is set and at least one inspected commit was red. Also returned for a usage error such as a malformed `--repo OWNER/NAME` value. |
 
 By default `actstat` reports without gating (exit `0`); pass `--fail-on-failure`
-to turn a non-successful run into a non-zero exit for cron/CI.
+to turn a red commit into a non-zero exit for cron/CI.
 
 ## Cronjob recipe
 
@@ -349,9 +383,12 @@ monitor can distinguish a broken pipeline from a broken check.
 - **A repository shows an error row (`403`/`404`)** — the token can't see it, or
   it doesn't exist. This is isolated per repository and never aborts the run; the
   rest of your projects still report.
-- **"no completed runs"** — the repository has Actions enabled but no completed
-  workflow runs yet (new repo, or Actions disabled). This is a neutral state, not
-  an error.
+- **A repo is missing from output** — it had no qualifying settled commits in
+  the recent default-branch run window. Empty repos are omitted rather than shown
+  as neutral rows.
+- **The newest GitHub commit is absent** — it still has queued or in-progress
+  workflow runs. `actstat` reports the most recent default-branch commit whose
+  workflow runs have all completed.
 - **Use `-v` to diagnose** — add `--verbose` to print the token source and how
   many repositories are being inspected (on stderr, so stdout stays clean).
 
@@ -360,9 +397,9 @@ monitor can distinguish a broken pipeline from a broken check.
 The crate is split into a thin binary (`src/main.rs`) and a library (`src/lib.rs`)
 so all logic is unit-testable without spawning a process or touching the network.
 Every output format renders from one normalized result model
-(`Report → RepoReport → RunReport → JobReport → StepReport`), so GitHub-parsing
-logic lives in exactly one place. HTTP is mocked in tests (`wiremock`); no test
-requires real credentials or network.
+(`Report → RepoReport → CommitReport → RunReport → JobReport → StepReport`), so
+GitHub-parsing logic lives in exactly one place. HTTP is mocked in tests
+(`wiremock`); no test requires real credentials or network.
 
 ```sh
 cargo fmt                                   # format

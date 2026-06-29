@@ -19,7 +19,7 @@ use crate::github::{self, DiscoveredToken};
 use crate::model::{RepoReport, Report};
 use crate::render;
 
-/// Report the status of recent GitHub Actions workflow runs across repos.
+/// Report the status of recent settled GitHub Actions commits across repos.
 #[derive(Debug, Parser)]
 #[command(
     name = "actstat",
@@ -41,14 +41,14 @@ pub struct Cli {
 /// The set of subcommands. Today there is exactly one.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// List recent workflow-run status per repository (the default command).
+    /// List recent settled commit status per repository (the default command).
     List(ListArgs),
 }
 
 /// Options for the `list` command (and the bare `actstat` invocation).
 #[derive(Debug, Clone, Args)]
 pub struct ListArgs {
-    /// Number of most-recent completed runs to inspect per repository.
+    /// Number of most-recent settled commits to inspect per repository.
     #[arg(
         short = 'n',
         long,
@@ -70,7 +70,7 @@ pub struct ListArgs {
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, value_name = "WHEN")]
     pub color: ColorChoice,
 
-    /// Show only non-passing runs in human output.
+    /// Show only failing commits in human output.
     #[arg(long)]
     pub only_failures: bool,
 
@@ -82,7 +82,7 @@ pub struct ListArgs {
     #[arg(long, value_name = "N", default_value_t = 8)]
     pub concurrency: usize,
 
-    /// Exit non-zero if any inspected run is non-successful (for cron/CI).
+    /// Exit non-zero if any inspected commit is failing (for cron/CI).
     #[arg(long)]
     pub fail_on_failure: bool,
 
@@ -177,7 +177,7 @@ pub fn run() -> ExitCode {
 }
 
 /// Execute the `list` command end to end: load config, resolve repositories,
-/// collect their recent run status, render the chosen format to stdout, and
+/// collect recent settled commit status, render the chosen format to stdout, and
 /// return the exit code per the documented table.
 ///
 /// Diagnostics, warnings, and progress go to stderr so machine output on stdout
@@ -225,7 +225,7 @@ async fn run_list(args: ListArgs) -> ExitCode {
     if args.verbose > 0 && !args.quiet {
         let _ = writeln!(
             std::io::stderr(),
-            "actstat: inspecting {} repositor{} (limit={}, concurrency={})",
+            "actstat: inspecting {} repositor{} (settled-commit limit={}, concurrency={})",
             repos.len(),
             if repos.len() == 1 { "y" } else { "ies" },
             args.limit,
@@ -243,6 +243,7 @@ async fn run_list(args: ListArgs) -> ExitCode {
     .await;
     reports.extend(org_error_reports(resolved.org_errors));
     reports.sort_by(|a, b| a.repo.cmp(&b.repo));
+    suppress_empty_success_reports(&mut reports);
 
     // 7. The single report every renderer reads from.
     let report = Report {
@@ -296,10 +297,17 @@ fn org_error_reports(org_errors: Vec<(String, String)>) -> Vec<RepoReport> {
         .into_iter()
         .map(|(org, message)| RepoReport {
             repo: org,
-            runs: vec![],
+            commits: vec![],
             error: Some(format!("failed to expand org: {message}")),
         })
         .collect()
+}
+
+/// Drop repositories that produced no settled commits and no error. Error rows
+/// stay visible; empty successful repos are suppressed in every output format.
+fn suppress_empty_success_reports(reports: &mut Vec<RepoReport>) {
+    reports
+        .retain(|report| !report.commits.is_empty() || report.error.is_some());
 }
 
 /// Restrict `repos` to the `--repo` selection, if any. With no selection the
@@ -338,9 +346,8 @@ fn all_repos_errored(report: &Report) -> bool {
 /// Map a rendered report to its process exit code per the documented table:
 ///
 /// - `1` — operational failure (here: every inspected repository errored).
-/// - `2` — `--fail-on-failure` is set and at least one inspected run was
-///   non-successful.
-/// - `0` — otherwise; the run completed and conclusions were reported.
+/// - `2` — `--fail-on-failure` is set and at least one inspected commit is red.
+/// - `0` — otherwise; the command completed and conclusions were reported.
 fn list_exit_code(report: &Report, fail_on_failure: bool) -> ExitCode {
     if all_repos_errored(report) {
         ExitCode::from(1)
@@ -498,8 +505,8 @@ mod tests {
     }
 
     #[test]
-    fn exit_two_when_fail_on_failure_and_a_run_failed() {
-        // The stub report mixes a passing run, a failing run, and an error row.
+    fn exit_two_when_fail_on_failure_and_a_commit_failed() {
+        // The stub report mixes a green commit, a red commit, and an error row.
         let report = Report::stub(1);
         assert!(report.has_failures());
         assert!(!all_repos_errored(&report), "the stub is not all-errored");
@@ -507,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_zero_without_fail_on_failure_even_with_red_runs() {
+    fn exit_zero_without_fail_on_failure_even_with_red_commits() {
         let report = Report::stub(1);
         assert!(same_code(list_exit_code(&report, false), ExitCode::SUCCESS));
     }
@@ -577,11 +584,27 @@ mod tests {
         )]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].repo, "bad-org");
-        assert!(rows[0].runs.is_empty());
+        assert!(rows[0].commits.is_empty());
         assert!(rows[0]
             .error
             .as_deref()
             .unwrap()
             .contains("failed to expand org"));
+    }
+
+    #[test]
+    fn suppress_empty_reports_keeps_commits_and_errors() {
+        let mut rows = Report::stub(1).repos;
+        rows.push(RepoReport {
+            repo: "o/empty".to_string(),
+            commits: vec![],
+            error: None,
+        });
+
+        suppress_empty_success_reports(&mut rows);
+
+        assert!(rows.iter().any(|r| r.repo == "bbugyi200/actstat"));
+        assert!(rows.iter().any(|r| r.repo == "bobs-org/locked"));
+        assert!(!rows.iter().any(|r| r.repo == "o/empty"));
     }
 }

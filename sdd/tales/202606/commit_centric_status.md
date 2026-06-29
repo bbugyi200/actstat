@@ -1,6 +1,6 @@
 ---
 create_time: 2026-06-29 09:24:15
-status: wip
+status: done
 prompt: sdd/prompts/202606/commit_centric_status.md
 ---
 # Plan: Commit-centric `actstat list` (settled-commit selection + empty-repo suppression)

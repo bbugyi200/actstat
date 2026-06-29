@@ -18,15 +18,15 @@
 //! 4. [`resolve_repositories`] — expand every configured org (bounded
 //!    concurrency), then merge with the explicit repos through Phase 2's
 //!    [`resolve_repos`] into one de-duplicated, alphabetically-stable list.
-//! 5. [`GitHubClient::list_completed_runs`] / [`GitHubClient::list_run_jobs`] —
-//!    fetch the most recent completed runs for a repo and, for a non-successful
-//!    run, its failed jobs and steps, normalized into the [`RunReport`] tree.
+//! 5. [`GitHubClient::list_run_jobs`] — fetch failed jobs and steps for a
+//!    non-passing workflow run.
 //! 6. [`fetch_repo_reports`] — run a per-repository async operation across many
 //!    repos with bounded concurrency, isolating each repo's failure into a
 //!    [`RepoReport`] error record so one bad repo never aborts the whole run.
 //! 7. [`collect_repo_reports`] — the Phase 4 pipeline: fan out over the resolved
-//!    repos, fetching each one's completed runs and enriching its failures, into
-//!    a sorted list of [`RepoReport`]s ready for any renderer.
+//!    repos, selecting each one's most recent settled default-branch commits and
+//!    enriching their failed runs into a sorted list of [`RepoReport`]s ready for
+//!    any renderer.
 
 use std::future::Future;
 use std::time::Duration;
@@ -39,7 +39,9 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::{resolve_repos, Config, OrgSource, RepoName};
-use crate::model::{Conclusion, JobReport, RepoReport, RunReport, StepReport};
+use crate::model::{
+    CommitReport, Conclusion, JobReport, RepoReport, RunReport, StepReport,
+};
 
 /// The real GitHub REST API base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.github.com";
@@ -347,29 +349,6 @@ impl GitHubClient {
             .collect())
     }
 
-    /// Fetch the most recent completed workflow runs for one repository,
-    /// normalized into [`RunReport`]s (newest-completed-first, as GitHub orders
-    /// them).
-    ///
-    /// Issues a single `GET /repos/{owner}/{repo}/actions/runs?status=completed`
-    /// with `per_page` set to the requested `limit` (capped at the API maximum
-    /// of 100), so `limit` applies *per repository* and the common case costs
-    /// exactly one request. The returned runs carry no failure detail — use
-    /// [`GitHubClient::list_run_jobs`] to enrich non-successful runs, or
-    /// [`collect_repo_reports`] for the full pipeline.
-    pub async fn list_completed_runs(
-        &self,
-        repo: &RepoName,
-        limit: u32,
-    ) -> Result<Vec<RunReport>, GitHubError> {
-        Ok(self
-            .fetch_completed_runs(repo, limit)
-            .await?
-            .into_iter()
-            .map(|api| normalize_run(api).1)
-            .collect())
-    }
-
     /// Fetch the failed jobs (and their failed steps) for one run.
     ///
     /// Issues `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` and keeps
@@ -394,44 +373,104 @@ impl GitHubClient {
             .collect())
     }
 
-    /// Fetch + normalize one repository's completed runs and enrich each
-    /// non-successful run with its failed jobs/steps. The per-repo unit of work
-    /// behind [`collect_repo_reports`].
-    async fn collect_runs(
+    /// Fetch + normalize one repository's most recent settled default-branch
+    /// commits and enrich every problem run with its failed jobs/steps. The
+    /// per-repo unit of work behind [`collect_repo_reports`].
+    async fn collect_commits(
         &self,
         repo: &RepoName,
         limit: u32,
-    ) -> Result<Vec<RunReport>, GitHubError> {
-        let api_runs = self.fetch_completed_runs(repo, limit).await?;
-        let mut runs = Vec::with_capacity(api_runs.len());
-        for api in api_runs {
-            let (run_id, mut run) = normalize_run(api);
-            // Successful runs need no job expansion; only spend a second request
-            // on runs that actually broke. `run_id == 0` only happens for a
-            // malformed payload missing the id — skip enrichment rather than
-            // building a bogus jobs URL.
-            if !run.conclusion.is_success() && run_id != 0 {
-                run.jobs = self.list_run_jobs(repo, run_id).await?;
-            }
-            runs.push(run);
+    ) -> Result<Vec<CommitReport>, GitHubError> {
+        let default_branch = self.repo_default_branch(repo).await?;
+        let api_runs = self
+            .fetch_default_branch_runs(repo, &default_branch)
+            .await?;
+        let selected = select_settled_commits(api_runs, limit);
+        let mut commits = Vec::with_capacity(selected.len());
+        for commit in selected {
+            commits.push(
+                self.build_commit_report(repo, &default_branch, commit)
+                    .await?,
+            );
         }
-        Ok(runs)
+        Ok(commits)
     }
 
-    /// The raw runs request shared by [`list_completed_runs`] (which drops the
-    /// id) and [`collect_runs`] (which keeps the id to fetch jobs).
-    async fn fetch_completed_runs(
+    /// Resolve a repository's default branch.
+    async fn repo_default_branch(
         &self,
         repo: &RepoName,
-        limit: u32,
+    ) -> Result<String, GitHubError> {
+        let path = format!("/repos/{}/{}", repo.owner, repo.name);
+        let detail: ApiRepoDetail = self.get(&path).await?;
+        Ok(detail.default_branch)
+    }
+
+    /// Fetch one bounded window of recent workflow runs on the default branch.
+    ///
+    /// This intentionally does not use `status=completed`: non-completed runs
+    /// are needed to identify and skip commits that have not fully settled yet.
+    async fn fetch_default_branch_runs(
+        &self,
+        repo: &RepoName,
+        branch: &str,
     ) -> Result<Vec<ApiRun>, GitHubError> {
-        let per_page = limit.clamp(1, 100);
+        let branch = percent_encode_query_value(branch);
         let path = format!(
-            "/repos/{}/{}/actions/runs?status=completed&per_page={per_page}",
+            "/repos/{}/{}/actions/runs?branch={branch}&per_page=100",
             repo.owner, repo.name
         );
         let response: RunsResponse = self.get(&path).await?;
         Ok(response.workflow_runs)
+    }
+
+    /// Build one commit report and enrich every problem run. Successful,
+    /// skipped, and neutral runs need no job expansion.
+    async fn build_commit_report(
+        &self,
+        repo: &RepoName,
+        default_branch: &str,
+        selected: SelectedCommit,
+    ) -> Result<CommitReport, GitHubError> {
+        let title = selected
+            .runs
+            .iter()
+            .find_map(|r| r.display_title.clone())
+            .unwrap_or_default();
+        let event = selected
+            .runs
+            .iter()
+            .find_map(|r| r.event.clone())
+            .unwrap_or_default();
+        let finished_at = latest_updated_at(&selected.runs);
+        let duration_seconds = compute_commit_duration_seconds(&selected.runs);
+        let short_sha: String = selected.full_sha.chars().take(7).collect();
+        let url = format!(
+            "https://github.com/{}/{}/commit/{}",
+            repo.owner, repo.name, selected.full_sha
+        );
+
+        let mut runs = Vec::with_capacity(selected.runs.len());
+        for api in selected.runs {
+            let (run_id, mut run) = normalize_run(api);
+            if run.is_problem() && run_id != 0 {
+                run.jobs = self.list_run_jobs(repo, run_id).await?;
+            }
+            runs.push(run);
+        }
+        let conclusion = CommitReport::aggregate_conclusion(&runs);
+
+        Ok(CommitReport {
+            sha: short_sha,
+            title,
+            branch: default_branch.to_string(),
+            event,
+            conclusion,
+            url,
+            finished_at,
+            duration_seconds,
+            runs,
+        })
     }
 
     /// Fetch a single page, retrying transient failures per [`RetryConfig`].
@@ -588,6 +627,13 @@ struct ApiOwner {
     login: String,
 }
 
+/// Minimal projection of a repository from `GET /repos/{owner}/{repo}`.
+#[derive(Debug, Deserialize)]
+struct ApiRepoDetail {
+    #[serde(default)]
+    default_branch: String,
+}
+
 // --- Workflow run / job payloads & normalization ---------------------------
 
 /// Envelope of `GET /repos/{owner}/{repo}/actions/runs`.
@@ -604,10 +650,12 @@ struct RunsResponse {
 /// Every field tolerates absence (`#[serde(default)]`) so a partial or
 /// malformed payload degrades to sensible defaults instead of failing the whole
 /// repository — only the fields actually used by [`normalize_run`] are modeled.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ApiRun {
     #[serde(default)]
     id: u64,
+    #[serde(default)]
+    workflow_id: Option<u64>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -620,6 +668,8 @@ struct ApiRun {
     head_branch: Option<String>,
     #[serde(default)]
     head_sha: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
     #[serde(default)]
@@ -664,8 +714,8 @@ struct ApiStep {
 }
 
 /// Normalize one API run into a [`RunReport`], returning the run id alongside it
-/// (the id is needed to fetch jobs for non-successful runs but is not part of
-/// the rendered model). The head SHA is shortened to 7 characters.
+/// (the id is needed to fetch jobs for problem runs but is not part of the
+/// rendered model). The head SHA is shortened to 7 characters.
 fn normalize_run(api: ApiRun) -> (u64, RunReport) {
     let sha: String =
         api.head_sha.unwrap_or_default().chars().take(7).collect();
@@ -691,6 +741,131 @@ fn normalize_run(api: ApiRun) -> (u64, RunReport) {
     (api.id, report)
 }
 
+/// A selected commit with its full SHA and deduplicated latest workflow runs.
+#[derive(Debug)]
+struct SelectedCommit {
+    full_sha: String,
+    runs: Vec<ApiRun>,
+}
+
+/// Select the `limit` most recent settled commits from a newest-first run
+/// listing. Runs are grouped by full head SHA in first-appearance order, then
+/// deduplicated to the latest run per workflow before settlement is evaluated.
+fn select_settled_commits(
+    runs: Vec<ApiRun>,
+    limit: u32,
+) -> Vec<SelectedCommit> {
+    let mut groups: Vec<(String, Vec<ApiRun>)> = Vec::new();
+    for run in runs {
+        let full_sha = run.head_sha.clone().unwrap_or_default();
+        if let Some((_, grouped)) =
+            groups.iter_mut().find(|(sha, _)| sha == &full_sha)
+        {
+            grouped.push(run);
+        } else {
+            groups.push((full_sha, vec![run]));
+        }
+    }
+
+    let mut selected = Vec::new();
+    for (full_sha, runs) in groups {
+        let runs = dedupe_latest_runs_per_workflow(runs);
+        if runs.iter().all(run_is_completed) {
+            selected.push(SelectedCommit { full_sha, runs });
+            if selected.len() >= limit as usize {
+                break;
+            }
+        }
+    }
+    selected
+}
+
+/// Collapse repeated attempts of the same workflow to the highest run id.
+fn dedupe_latest_runs_per_workflow(runs: Vec<ApiRun>) -> Vec<ApiRun> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut deduped: Vec<ApiRun> = Vec::new();
+
+    for run in runs {
+        let key = workflow_key(&run);
+        if let Some(index) = keys.iter().position(|k| k == &key) {
+            if run.id > deduped[index].id {
+                deduped[index] = run;
+            }
+        } else {
+            keys.push(key);
+            deduped.push(run);
+        }
+    }
+
+    deduped
+}
+
+fn workflow_key(run: &ApiRun) -> String {
+    match run.workflow_id {
+        Some(id) => format!("id:{id}"),
+        None => format!("name:{}", run.name.as_deref().unwrap_or_default()),
+    }
+}
+
+fn run_is_completed(run: &ApiRun) -> bool {
+    run.status.as_deref() == Some("completed")
+}
+
+fn latest_updated_at(runs: &[ApiRun]) -> String {
+    let mut fallback: Option<&str> = None;
+    let mut latest: Option<(&str, jiff::Timestamp)> = None;
+
+    for run in runs {
+        let Some(value) = run.updated_at.as_deref().filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        fallback.get_or_insert(value);
+        let Ok(timestamp) = value.parse::<jiff::Timestamp>() else {
+            continue;
+        };
+        if latest.is_none_or(|(_, current)| timestamp > current) {
+            latest = Some((value, timestamp));
+        }
+    }
+
+    latest
+        .map(|(value, _)| value.to_string())
+        .or_else(|| fallback.map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Compute aggregate commit duration: earliest run start to latest run finish.
+/// Returns `None` when any selected run lacks parseable start/end timestamps.
+fn compute_commit_duration_seconds(runs: &[ApiRun]) -> Option<u64> {
+    if runs.is_empty() {
+        return None;
+    }
+
+    let mut earliest_start: Option<jiff::Timestamp> = None;
+    let mut latest_end: Option<jiff::Timestamp> = None;
+    for run in runs {
+        let start: jiff::Timestamp = run
+            .run_started_at
+            .as_deref()
+            .or(run.created_at.as_deref())?
+            .parse()
+            .ok()?;
+        let end: jiff::Timestamp = run.updated_at.as_deref()?.parse().ok()?;
+
+        if earliest_start.is_none_or(|current| start < current) {
+            earliest_start = Some(start);
+        }
+        if latest_end.is_none_or(|current| end > current) {
+            latest_end = Some(end);
+        }
+    }
+
+    let start = earliest_start?;
+    let end = latest_end?;
+    Some((end.as_second() - start.as_second()).max(0) as u64)
+}
+
 /// Compute a workflow run's wall-clock duration in seconds.
 ///
 /// The start timestamp is `run_started_at` when present, falling back to
@@ -714,7 +889,7 @@ fn compute_duration_seconds(
 /// kept.
 fn normalize_job(api: ApiJob) -> Option<JobReport> {
     let conclusion = Conclusion::from_github(api.conclusion.as_deref());
-    if !is_problem(conclusion) {
+    if !conclusion.is_problem() {
         return None;
     }
     Some(JobReport {
@@ -729,7 +904,7 @@ fn normalize_job(api: ApiJob) -> Option<JobReport> {
 /// actionable problem (passing/skipped steps are noise in a failure report).
 fn normalize_step(api: ApiStep) -> Option<StepReport> {
     let conclusion = Conclusion::from_github(api.conclusion.as_deref());
-    if !is_problem(conclusion) {
+    if !conclusion.is_problem() {
         return None;
     }
     Some(StepReport {
@@ -739,17 +914,25 @@ fn normalize_step(api: ApiStep) -> Option<StepReport> {
     })
 }
 
-/// Whether a conclusion is an actionable problem worth surfacing in failure
-/// detail. Success, skipped, and neutral are *not* problems; everything else
-/// (failure, cancelled, timed_out, action_required, startup_failure, stale) is.
-fn is_problem(conclusion: Conclusion) -> bool {
-    !matches!(
-        conclusion,
-        Conclusion::Success | Conclusion::Skipped | Conclusion::Neutral
-    )
-}
-
 // --- HTTP helpers (pure, unit-testable) ------------------------------------
+
+/// Percent-encode a query parameter value without adding another dependency.
+fn percent_encode_query_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+        {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
 
 /// Parse the `Link` header for the `rel="next"` URL, if present.
 fn parse_next_link(headers: &HeaderMap) -> Option<String> {
@@ -885,11 +1068,11 @@ pub async fn resolve_repositories(
 /// concurrency, isolating each repo's failure into a [`RepoReport`] error
 /// record so one failing repo never aborts the whole run.
 ///
-/// `op` returns the repo's runs on success or a [`GitHubError`] on failure; the
-/// error's message is stored in [`RepoReport::error`]. Results come back sorted
-/// by `owner/name` for stable output regardless of completion order. Phase 4
-/// supplies the real `op` (fetch completed runs + enrich non-successful ones);
-/// the fan-out, concurrency bound, and error isolation are owned here.
+/// `op` returns the repo's commits on success or a [`GitHubError`] on failure;
+/// the error's message is stored in [`RepoReport::error`]. Results come back
+/// sorted by `owner/name` for stable output regardless of completion order.
+/// Phase 4 supplies the real `op` (select settled commits + enrich failed
+/// runs); the fan-out, concurrency bound, and error isolation are owned here.
 pub async fn fetch_repo_reports<F, Fut>(
     repos: Vec<RepoName>,
     concurrency: usize,
@@ -897,7 +1080,7 @@ pub async fn fetch_repo_reports<F, Fut>(
 ) -> Vec<RepoReport>
 where
     F: Fn(RepoName) -> Fut,
-    Fut: Future<Output = Result<Vec<RunReport>, GitHubError>>,
+    Fut: Future<Output = Result<Vec<CommitReport>, GitHubError>>,
 {
     let mut reports: Vec<RepoReport> =
         futures::stream::iter(repos.into_iter().map(|repo| {
@@ -905,14 +1088,14 @@ where
             async move {
                 let name = repo.full_name();
                 match fut.await {
-                    Ok(runs) => RepoReport {
+                    Ok(commits) => RepoReport {
                         repo: name,
-                        runs,
+                        commits,
                         error: None,
                     },
                     Err(e) => RepoReport {
                         repo: name,
-                        runs: vec![],
+                        commits: vec![],
                         error: Some(e.to_string()),
                     },
                 }
@@ -927,15 +1110,17 @@ where
 }
 
 /// The Phase 4 collection pipeline: fan out over `repos` (bounded by
-/// `concurrency`), fetching each repository's `limit` most-recent completed runs
-/// and enriching every non-successful run with its failed jobs and steps.
+/// `concurrency`), fetching each repository's `limit` most-recent settled
+/// commits on the default branch and enriching every problem run with its failed
+/// jobs and steps.
 ///
 /// Each repository is isolated by [`fetch_repo_reports`]: a repo that errors
 /// (no access, Actions disabled, rate-limited, malformed at the HTTP layer)
-/// becomes a [`RepoReport`] error row instead of aborting the run, and a repo
-/// with no completed runs becomes a neutral empty [`RepoReport`]. Results come
-/// back sorted by `owner/name`. Pair the returned `repos` with metadata to build
-/// a [`crate::model::Report`] for rendering.
+/// becomes a [`RepoReport`] error row instead of aborting the run. A repo with
+/// no settled commits returns an empty [`RepoReport`] for the CLI assembly step
+/// to suppress consistently across renderers. Results come back sorted by
+/// `owner/name`. Pair the returned `repos` with metadata to build a
+/// [`crate::model::Report`] for rendering.
 pub async fn collect_repo_reports(
     client: &GitHubClient,
     repos: Vec<RepoName>,
@@ -944,7 +1129,7 @@ pub async fn collect_repo_reports(
 ) -> Vec<RepoReport> {
     fetch_repo_reports(repos, concurrency, |repo| {
         let client = client.clone();
-        async move { client.collect_runs(&repo, limit).await }
+        async move { client.collect_commits(&repo, limit).await }
     })
     .await
 }
@@ -1448,17 +1633,62 @@ mod tests {
     fn run_json(id: u64, conclusion: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
+            "workflow_id": id,
             "name": "CI",
             "display_title": "Tidy up the build",
             "run_number": id,
             "event": "push",
             "head_branch": "main",
             "head_sha": "abcdef1234567890deadbeef",
+            "status": "completed",
             "conclusion": conclusion,
             "html_url": format!("https://github.com/o/r/actions/runs/{id}"),
             "created_at": "2026-06-29T11:50:00Z",
             "updated_at": "2026-06-29T11:52:30Z",
         })
+    }
+
+    fn run_json_with(
+        id: u64,
+        workflow_id: u64,
+        workflow: &str,
+        sha: &str,
+        status: &str,
+        conclusion: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "workflow_id": workflow_id,
+            "name": workflow,
+            "display_title": format!("Commit {sha}"),
+            "run_number": id,
+            "event": "push",
+            "head_branch": "main",
+            "head_sha": sha,
+            "status": status,
+            "conclusion": conclusion,
+            "html_url": format!("https://github.com/o/r/actions/runs/{id}"),
+            "created_at": "2026-06-29T11:50:00Z",
+            "updated_at": "2026-06-29T11:52:30Z",
+        })
+    }
+
+    fn api_run(
+        id: u64,
+        workflow_id: u64,
+        sha: &str,
+        status: &str,
+        conclusion: Option<&str>,
+    ) -> ApiRun {
+        serde_json::from_value(run_json_with(
+            id,
+            workflow_id,
+            "CI",
+            sha,
+            status,
+            conclusion,
+        ))
+        .expect("test run JSON matches ApiRun")
     }
 
     /// The runs-listing envelope around a set of runs.
@@ -1494,7 +1724,23 @@ mod tests {
         serde_json::json!({ "total_count": jobs.len(), "jobs": jobs })
     }
 
-    /// Mount a runs-listing response for `owner/name`.
+    /// Mount a repository detail response for `owner/name`.
+    async fn mount_repo_detail(
+        server: &MockServer,
+        owner: &str,
+        name: &str,
+        default_branch: &str,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{owner}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "default_branch": default_branch }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a default-branch runs-listing response for `owner/name`.
     async fn mount_runs(
         server: &MockServer,
         owner: &str,
@@ -1503,6 +1749,8 @@ mod tests {
     ) {
         Mock::given(method("GET"))
             .and(path(format!("/repos/{owner}/{name}/actions/runs")))
+            .and(query_param("branch", "main"))
+            .and(query_param("per_page", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
@@ -1531,12 +1779,14 @@ mod tests {
     fn normalize_run_shortens_sha_and_maps_fields() {
         let (id, run) = normalize_run(ApiRun {
             id: 7,
+            workflow_id: Some(10),
             name: Some("CI".into()),
             display_title: Some("Fix it".into()),
             run_number: 42,
             event: Some("pull_request".into()),
             head_branch: Some("feature/x".into()),
             head_sha: Some("abcdef1234567890".into()),
+            status: Some("completed".into()),
             conclusion: Some("success".into()),
             html_url: Some("https://example/run".into()),
             created_at: Some("2026-06-29T11:50:00Z".into()),
@@ -1668,9 +1918,9 @@ mod tests {
 
     #[test]
     fn is_problem_excludes_success_skipped_neutral() {
-        assert!(!is_problem(Conclusion::Success));
-        assert!(!is_problem(Conclusion::Skipped));
-        assert!(!is_problem(Conclusion::Neutral));
+        assert!(!Conclusion::Success.is_problem());
+        assert!(!Conclusion::Skipped.is_problem());
+        assert!(!Conclusion::Neutral.is_problem());
         for c in [
             Conclusion::Failure,
             Conclusion::Cancelled,
@@ -1679,27 +1929,76 @@ mod tests {
             Conclusion::StartupFailure,
             Conclusion::Stale,
         ] {
-            assert!(is_problem(c), "{c:?} is an actionable problem");
+            assert!(c.is_problem(), "{c:?} is an actionable problem");
         }
     }
 
-    // --- Completed-run fetch (mocked HTTP) ------------------------------
+    // --- Settled-commit selection ---------------------------------------
+
+    #[test]
+    fn select_settled_commits_skips_unsettled_newer_commits_and_applies_limit()
+    {
+        let runs = vec![
+            api_run(5, 1, "newest", "queued", None),
+            api_run(4, 1, "settled-red", "completed", Some("failure")),
+            api_run(3, 2, "settled-red", "completed", Some("success")),
+            api_run(2, 1, "settled-green", "completed", Some("success")),
+        ];
+
+        let selected = select_settled_commits(runs, 1);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].full_sha, "settled-red");
+        assert_eq!(selected[0].runs.len(), 2);
+    }
+
+    #[test]
+    fn select_settled_commits_keeps_latest_run_per_workflow() {
+        let runs = vec![
+            api_run(10, 1, "abc", "completed", Some("success")),
+            api_run(12, 1, "abc", "completed", Some("failure")),
+            api_run(11, 2, "abc", "completed", Some("success")),
+        ];
+
+        let selected = select_settled_commits(runs, 1);
+        let ids: Vec<u64> = selected[0].runs.iter().map(|run| run.id).collect();
+
+        assert_eq!(ids, vec![12, 11]);
+    }
+
+    #[test]
+    fn select_settled_commits_treats_latest_rerun_status_as_authoritative() {
+        let runs = vec![
+            api_run(10, 1, "abc", "completed", Some("failure")),
+            api_run(12, 1, "abc", "in_progress", None),
+        ];
+
+        let selected = select_settled_commits(runs, 1);
+
+        assert!(
+            selected.is_empty(),
+            "newer in-progress rerun makes the commit unsettled"
+        );
+    }
+
+    // --- Commit collection (mocked HTTP) --------------------------------
 
     #[tokio::test]
-    async fn passing_run_is_one_line_with_no_jobs_request() {
+    async fn passing_commit_needs_no_jobs_request() {
         let server = MockServer::start().await;
+        mount_repo_detail(&server, "o", "r", "main").await;
         mount_runs(&server, "o", "r", runs_body(vec![run_json(1, "success")]))
             .await;
         // Deliberately mount NO jobs endpoint: a successful run must not trigger
         // one, so collection still succeeds.
 
         let client = test_client(&server.uri());
-        let runs = client.collect_runs(&repo("o", "r"), 1).await.unwrap();
-        assert_eq!(runs.len(), 1);
-        assert!(runs[0].is_success());
+        let commits = client.collect_commits(&repo("o", "r"), 1).await.unwrap();
+        assert_eq!(commits.len(), 1);
+        assert!(commits[0].is_success());
         assert!(
-            runs[0].jobs.is_empty(),
-            "passing runs carry no job expansion"
+            commits[0].runs[0].jobs.is_empty(),
+            "non-problem runs carry no job expansion"
         );
 
         // Prove the jobs endpoint was never called.
@@ -1713,8 +2012,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_run_is_enriched_with_failed_jobs_and_steps() {
+    async fn failed_commit_is_enriched_with_failed_jobs_and_steps() {
         let server = MockServer::start().await;
+        mount_repo_detail(&server, "o", "r", "main").await;
         mount_runs(&server, "o", "r", runs_body(vec![run_json(2, "failure")]))
             .await;
         mount_jobs(
@@ -1740,9 +2040,10 @@ mod tests {
         .await;
 
         let client = test_client(&server.uri());
-        let runs = client.collect_runs(&repo("o", "r"), 1).await.unwrap();
-        assert_eq!(runs.len(), 1);
-        let run = &runs[0];
+        let commits = client.collect_commits(&repo("o", "r"), 1).await.unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].conclusion, Conclusion::Failure);
+        let run = &commits[0].runs[0];
         assert_eq!(run.conclusion, Conclusion::Failure);
         assert_eq!(
             run.jobs.len(),
@@ -1759,8 +2060,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_and_timed_out_runs_are_non_success_and_enriched() {
+    async fn all_problem_runs_on_a_commit_are_enriched() {
         let server = MockServer::start().await;
+        mount_repo_detail(&server, "o", "r", "main").await;
         mount_runs(
             &server,
             "o",
@@ -1795,12 +2097,15 @@ mod tests {
         .await;
 
         let client = test_client(&server.uri());
-        let runs = client.collect_runs(&repo("o", "r"), 3).await.unwrap();
-        assert_eq!(runs.len(), 3, "limit is per-repository");
+        let commits = client.collect_commits(&repo("o", "r"), 1).await.unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].runs.len(), 3);
+        assert_eq!(commits[0].conclusion, Conclusion::Failure);
 
-        let by_number =
-            |n: u64| runs.iter().find(|r| r.run_number == n).unwrap();
-        assert!(by_number(1).is_success());
+        let by_number = |n: u64| {
+            commits[0].runs.iter().find(|r| r.run_number == n).unwrap()
+        };
+        assert!(!by_number(1).is_problem());
         assert!(by_number(1).jobs.is_empty());
 
         let cancelled = by_number(2);
@@ -1813,9 +2118,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_completed_runs_is_a_neutral_empty_report() {
+    async fn no_settled_commits_is_an_empty_report_for_later_suppression() {
         let server = MockServer::start().await;
-        mount_runs(&server, "o", "empty", runs_body(vec![])).await;
+        mount_repo_detail(&server, "o", "empty", "main").await;
+        mount_runs(
+            &server,
+            "o",
+            "empty",
+            runs_body(vec![run_json_with(1, 1, "CI", "abc", "queued", None)]),
+        )
+        .await;
 
         let client = test_client(&server.uri());
         let reports =
@@ -1823,8 +2135,8 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].repo, "o/empty");
         assert!(
-            reports[0].runs.is_empty(),
-            "no runs is a valid neutral state"
+            reports[0].commits.is_empty(),
+            "no settled commits is not an error"
         );
         assert!(reports[0].error.is_none(), "empty is not an error");
     }
@@ -1832,6 +2144,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_run_payload_degrades_to_defaults() {
         let server = MockServer::start().await;
+        mount_repo_detail(&server, "o", "r", "main").await;
         // A partial run: only an id and a (passing) conclusion; every other
         // field is absent. It must not fail the repo.
         mount_runs(
@@ -1839,18 +2152,18 @@ mod tests {
             "o",
             "r",
             serde_json::json!({
-                "workflow_runs": [ { "id": 99, "conclusion": "success" } ]
+                "workflow_runs": [
+                    { "id": 99, "status": "completed", "conclusion": "success" }
+                ]
             }),
         )
         .await;
 
         let client = test_client(&server.uri());
-        let runs = client
-            .list_completed_runs(&repo("o", "r"), 1)
-            .await
-            .unwrap();
-        assert_eq!(runs.len(), 1);
-        let run = &runs[0];
+        let commits = client.collect_commits(&repo("o", "r"), 1).await.unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].branch, "main");
+        let run = &commits[0].runs[0];
         assert_eq!(run.conclusion, Conclusion::Success);
         assert_eq!(run.workflow, "", "missing fields default cleanly");
         assert_eq!(run.branch, "");
@@ -1860,13 +2173,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_completed_runs_sends_status_and_per_page() {
+    async fn collect_commits_sends_default_branch_and_per_page() {
         let server = MockServer::start().await;
-        // The request must carry status=completed and per_page == the limit.
+        mount_repo_detail(&server, "o", "r", "main").await;
+        // The request must carry branch=main and per_page=100, with no
+        // status=completed filter.
         Mock::given(method("GET"))
             .and(path("/repos/o/r/actions/runs"))
-            .and(query_param("status", "completed"))
-            .and(query_param("per_page", "3"))
+            .and(query_param("branch", "main"))
+            .and(query_param("per_page", "100"))
+            .and(query_param_is_missing("status"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(runs_body(vec![run_json(1, "success")])),
@@ -1876,11 +2192,8 @@ mod tests {
             .await;
 
         let client = test_client(&server.uri());
-        let runs = client
-            .list_completed_runs(&repo("o", "r"), 3)
-            .await
-            .unwrap();
-        assert_eq!(runs.len(), 1);
+        let commits = client.collect_commits(&repo("o", "r"), 3).await.unwrap();
+        assert_eq!(commits.len(), 1);
         // The `.expect(1)` on the mock asserts the query was exactly right.
     }
 
@@ -1921,6 +2234,7 @@ mod tests {
     async fn collect_repo_reports_renders_stable_json() {
         let server = MockServer::start().await;
         // A passing repo and a failing repo, fanned out together.
+        mount_repo_detail(&server, "o", "pass", "main").await;
         mount_runs(
             &server,
             "o",
@@ -1928,6 +2242,7 @@ mod tests {
             runs_body(vec![run_json(1, "success")]),
         )
         .await;
+        mount_repo_detail(&server, "o", "fail", "main").await;
         mount_runs(
             &server,
             "o",
@@ -1973,13 +2288,17 @@ mod tests {
         assert_eq!(repos[0]["repo"], "o/fail");
         assert_eq!(repos[1]["repo"], "o/pass");
 
-        // Passing repo: one passing run, no job expansion.
-        let pass_run = &repos[1]["runs"][0];
+        // Passing repo: one green commit, one passing run, no job expansion.
+        let pass_commit = &repos[1]["commits"][0];
+        assert_eq!(pass_commit["conclusion"], "success");
+        let pass_run = &pass_commit["runs"][0];
         assert_eq!(pass_run["conclusion"], "success");
         assert_eq!(pass_run["jobs"].as_array().unwrap().len(), 0);
 
-        // Failing repo: failed job + failed step with URLs preserved.
-        let fail_run = &repos[0]["runs"][0];
+        // Failing repo: red commit with failed job + failed step preserved.
+        let fail_commit = &repos[0]["commits"][0];
+        assert_eq!(fail_commit["conclusion"], "failure");
+        let fail_run = &fail_commit["runs"][0];
         assert_eq!(fail_run["conclusion"], "failure");
         assert_eq!(fail_run["jobs"][0]["name"], "test");
         assert_eq!(fail_run["jobs"][0]["steps"][0]["name"], "Run tests");
@@ -1993,11 +2312,11 @@ mod tests {
             .unwrap()
             .iter()
             .any(|repo| {
-                repo["runs"]
+                repo["commits"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|run| run["conclusion"] != "success")
+                    .any(|commit| commit["conclusion"] != "success")
             })
     }
 }

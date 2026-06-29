@@ -3,7 +3,7 @@
 //! - [`human`]: adaptive, colorized terminal output; reads cleanly with color
 //!   stripped (`--color never` / `NO_COLOR`).
 //! - [`json`]: one pretty-printed JSON document (metadata + repositories).
-//! - [`jsonl`]: one record per line — one per run, plus one per repo error —
+//! - [`jsonl`]: one record per line — one per commit, plus one per repo error —
 //!   each carrying its `repo`, for easy `jq`/shell piping.
 //!
 //! All three return a `String` (with a trailing newline) so they are trivially
@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 
 use owo_colors::{OwoColorize, Style};
 
-use crate::model::{Conclusion, Report, RunReport};
+use crate::model::{CommitReport, Conclusion, Report, RunReport};
 
 /// Apply `style` to `text` only when `use_color` is set; otherwise return the
 /// text verbatim with no escape codes (keeps no-color output byte-clean).
@@ -41,13 +41,13 @@ fn conclusion_style(conclusion: Conclusion) -> Style {
 
 /// Render the report as adaptive human-readable text.
 ///
-/// `use_color` controls ANSI styling; `only_failures` suppresses passing runs
+/// `use_color` controls ANSI styling; `only_failures` suppresses green commits
 /// (human output only — machine formats always include everything).
 ///
 /// Output is grouped by repository (one block each, separated by a blank line):
-/// a compact one-line summary per passing run, an expanded tree for failures,
-/// and clear single-line rows for neutral ("no completed runs") and errored
-/// repositories. Repositories the filters hide entirely produce no block.
+/// a compact one-line summary per green commit, an expanded tree for red
+/// commits, and clear single-line rows for errored repositories. Repositories
+/// the filters hide entirely produce no block.
 pub fn human(report: &Report, use_color: bool, only_failures: bool) -> String {
     let bold = Style::new().bold();
     let dim = Style::new().dimmed();
@@ -70,110 +70,124 @@ pub fn human(report: &Report, use_color: bool, only_failures: bool) -> String {
             continue;
         }
 
-        // Neutral: no completed runs (never silently disappears). Hidden when
-        // --only-failures is set, since there is nothing unhealthy to show.
-        if repo.runs.is_empty() {
-            if !only_failures {
-                let _ = writeln!(
-                    block,
-                    "{} {}  {}",
-                    paint(use_color, dim, "•"),
-                    paint(use_color, bold, &repo.repo),
-                    paint(use_color, dim, "no completed runs"),
-                );
-                blocks.push(block);
-            }
-            continue;
-        }
-
-        let visible_runs: Vec<&RunReport> = repo
-            .runs
+        let visible_commits: Vec<&CommitReport> = repo
+            .commits
             .iter()
-            .filter(|r| !only_failures || !r.is_success())
+            .filter(|c| !only_failures || !c.is_success())
             .collect();
-        if visible_runs.is_empty() {
+        if visible_commits.is_empty() {
             continue;
         }
 
         let _ = writeln!(block, "{}", paint(use_color, bold, &repo.repo));
-        for run in visible_runs {
-            render_run(&mut block, run, &report.generated_at, use_color);
+        for commit in visible_commits {
+            render_commit(&mut block, commit, &report.generated_at, use_color);
         }
         blocks.push(block);
     }
 
     if blocks.is_empty() {
-        return format!("{}\n", paint(use_color, dim, "no runs to report"));
+        return format!("{}\n", paint(use_color, dim, "no commits to report"));
     }
     // Each block already ends in a newline; joining with one more inserts a
     // single blank line between repositories without a trailing blank line.
     blocks.join("\n")
 }
 
-/// Render a single run: a compact one-liner for passes, plus an expanded tree
-/// of failed jobs → failed steps → URLs for non-successful runs.
+/// Render a single commit: a compact one-liner for green commits, plus an
+/// expanded tree of failed runs → failed jobs → failed steps → URLs for red
+/// commits.
 ///
 /// `generated_at` is the report timestamp the relative "x ago" time is measured
 /// against, so the rendering is deterministic for a given report.
-fn render_run(
+fn render_commit(
     out: &mut String,
-    run: &RunReport,
+    commit: &CommitReport,
     generated_at: &str,
     use_color: bool,
 ) {
-    let style = conclusion_style(run.conclusion);
+    let style = conclusion_style(commit.conclusion);
     let dim = Style::new().dimmed();
 
-    // Compact metadata trailing the workflow name: branch (when known), run
-    // number, how long the run took (when known), and relative completion time.
+    // Compact metadata trailing the commit title: branch, workflow count when
+    // useful, aggregate duration when known, and relative completion time.
     let mut meta: Vec<String> = Vec::new();
-    if !run.branch.is_empty() {
-        meta.push(run.branch.clone());
+    if !commit.branch.is_empty() {
+        meta.push(commit.branch.clone());
     }
-    meta.push(format!("#{}", run.run_number));
-    if let Some(secs) = run.duration_seconds {
+    if commit.runs.len() > 1 {
+        meta.push(format!("{} workflows", commit.runs.len()));
+    }
+    if let Some(secs) = commit.duration_seconds {
         meta.push(humanize_duration(secs));
     }
-    if let Some(rel) = relative_time(&run.updated_at, generated_at) {
+    if let Some(rel) = relative_time(&commit.finished_at, generated_at) {
         meta.push(rel);
     }
     let meta = meta.join(" · ");
 
-    // A malformed payload can leave the workflow name empty; show a placeholder
-    // rather than a confusing blank.
+    let title = if commit.title.is_empty() {
+        "(untitled commit)"
+    } else {
+        commit.title.as_str()
+    };
+    let summary = format!("{} {}", commit.sha, title);
+
+    if commit.is_success() {
+        let _ = writeln!(
+            out,
+            "  {} {} {}",
+            paint(use_color, style, commit.conclusion.icon()),
+            summary,
+            paint(use_color, dim, &format!("· {meta}")),
+        );
+        return;
+    }
+
+    let _ = writeln!(
+        out,
+        "  {} {} {} {}",
+        paint(use_color, style, commit.conclusion.icon()),
+        summary,
+        paint(use_color, dim, &format!("· {meta} ·")),
+        paint(use_color, style, commit.conclusion.label()),
+    );
+
+    for run in commit.runs.iter().filter(|r| r.is_problem()) {
+        render_failed_run(out, run, use_color);
+    }
+}
+
+/// Render one problem run inside a red commit.
+fn render_failed_run(out: &mut String, run: &RunReport, use_color: bool) {
+    let style = conclusion_style(run.conclusion);
+    let dim = Style::new().dimmed();
+
+    let mut meta = vec![format!("#{}", run.run_number)];
+    if let Some(secs) = run.duration_seconds {
+        meta.push(humanize_duration(secs));
+    }
+    meta.push(run.conclusion.label().to_string());
+    let meta = meta.join(" · ");
+
     let workflow = if run.workflow.is_empty() {
         "(unknown workflow)"
     } else {
         run.workflow.as_str()
     };
 
-    if run.is_success() {
-        let _ = writeln!(
-            out,
-            "  {} {} {}",
-            paint(use_color, style, run.conclusion.icon()),
-            workflow,
-            paint(use_color, dim, &format!("· {meta}")),
-        );
-        return;
-    }
-
-    // Non-success: the same compact line plus an explicit conclusion label
-    // (so cancelled/timed_out/etc. read clearly even with no failure detail),
-    // then the expanded failure tree.
     let _ = writeln!(
         out,
-        "  {} {} {} {}",
+        "      {} {} {}",
         paint(use_color, style, run.conclusion.icon()),
         workflow,
-        paint(use_color, dim, &format!("· {meta} ·")),
-        paint(use_color, style, run.conclusion.label()),
+        paint(use_color, dim, &format!("· {meta}")),
     );
 
     for job in &run.jobs {
         let _ = writeln!(
             out,
-            "      {} {}",
+            "          {} {}",
             paint(
                 use_color,
                 conclusion_style(job.conclusion),
@@ -184,7 +198,7 @@ fn render_run(
         for step in &job.steps {
             let _ = writeln!(
                 out,
-                "          {}",
+                "              {}",
                 paint(
                     use_color,
                     dim,
@@ -193,13 +207,16 @@ fn render_run(
             );
         }
         if !job.url.is_empty() {
-            let _ =
-                writeln!(out, "          {}", paint(use_color, dim, &job.url));
+            let _ = writeln!(
+                out,
+                "              {}",
+                paint(use_color, dim, &job.url)
+            );
         }
     }
     // A final jump-to link for the run as a whole.
     if !run.url.is_empty() {
-        let _ = writeln!(out, "      {}", paint(use_color, dim, &run.url));
+        let _ = writeln!(out, "          {}", paint(use_color, dim, &run.url));
     }
 }
 
@@ -268,7 +285,7 @@ pub fn json(report: &Report) -> String {
     s
 }
 
-/// Render the report as JSONL: one line per run, plus one per repo error,
+/// Render the report as JSONL: one line per commit, plus one per repo error,
 /// each tagged with `type` and `repo`.
 pub fn jsonl(report: &Report) -> String {
     let mut out = String::new();
@@ -281,12 +298,12 @@ pub fn jsonl(report: &Report) -> String {
             });
             let _ = writeln!(out, "{line}");
         }
-        for run in &repo.runs {
-            let mut value =
-                serde_json::to_value(run).expect("RunReport always serializes");
-            // Tag each run record with its origin so lines stand alone.
+        for commit in &repo.commits {
+            let mut value = serde_json::to_value(commit)
+                .expect("CommitReport always serializes");
+            // Tag each commit record with its origin so lines stand alone.
             if let serde_json::Value::Object(map) = &mut value {
-                map.insert("type".to_string(), serde_json::json!("run"));
+                map.insert("type".to_string(), serde_json::json!("commit"));
                 map.insert("repo".to_string(), serde_json::json!(repo.repo));
             }
             let _ = writeln!(out, "{value}");
@@ -317,7 +334,7 @@ pub use crate::cli::Format;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Report;
+    use crate::model::{RepoReport, Report};
 
     #[test]
     fn json_is_a_single_valid_document() {
@@ -331,22 +348,22 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_has_one_record_per_run_plus_per_error() {
+    fn jsonl_has_one_record_per_commit_plus_per_error() {
         let report = Report::stub(1);
-        let expected_runs: usize =
-            report.repos.iter().map(|r| r.runs.len()).sum();
+        let expected_commits: usize =
+            report.repos.iter().map(|r| r.commits.len()).sum();
         let expected_errors =
             report.repos.iter().filter(|r| r.error.is_some()).count();
         let out = jsonl(&report);
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), expected_runs + expected_errors);
+        assert_eq!(lines.len(), expected_commits + expected_errors);
 
         for line in &lines {
             let value: serde_json::Value = serde_json::from_str(line)
                 .expect("each jsonl line is valid JSON");
             let kind = value["type"].as_str().expect("each record is tagged");
-            assert!(kind == "run" || kind == "repo_error");
+            assert!(kind == "commit" || kind == "repo_error");
             assert!(
                 value.get("repo").is_some(),
                 "each record carries its repo"
@@ -363,8 +380,33 @@ mod tests {
             "no ANSI escape codes without color"
         );
         assert!(out.contains("bbugyi200/actstat"));
-        assert!(out.contains("no completed runs"), "neutral repo is shown");
         assert!(out.contains("403 Forbidden"), "repo error is shown");
+    }
+
+    #[test]
+    fn human_suppresses_empty_repo_blocks_but_keeps_errors() {
+        let report = Report {
+            generated_at: "2026-06-29T12:00:00Z".to_string(),
+            limit: 1,
+            repos: vec![
+                RepoReport {
+                    repo: "o/empty".to_string(),
+                    commits: vec![],
+                    error: None,
+                },
+                RepoReport {
+                    repo: "o/locked".to_string(),
+                    commits: vec![],
+                    error: Some("403 Forbidden".to_string()),
+                },
+            ],
+        };
+
+        let out = human(&report, false, false);
+
+        assert!(!out.contains("o/empty"));
+        assert!(out.contains("o/locked"));
+        assert!(out.contains("403 Forbidden"));
     }
 
     #[test]
@@ -383,32 +425,28 @@ mod tests {
     }
 
     #[test]
-    fn only_failures_hides_passing_runs_in_human() {
+    fn only_failures_hides_green_commits_in_human() {
         let report = Report::stub(1);
         let out = human(&report, false, true);
         // The passing-only repo's whole block (header included) is gone; the
-        // failing repo and its run stay, as does the errored repo.
+        // failing repo and its failed run stay, as does the errored repo.
         assert!(
             !out.contains("bbugyi200/actstat"),
-            "a repo with only passing runs is hidden"
+            "a repo with only green commits is hidden"
         );
         assert!(out.contains("bbugyi200/dotfiles"), "failing repo stays");
         assert!(out.contains("#128"), "the failing run stays");
         assert!(out.contains("bobs-org/locked"), "errors are still shown");
-        assert!(
-            !out.contains("no completed runs"),
-            "neutral repos are hidden under --only-failures"
-        );
     }
 
     #[test]
-    fn human_run_line_shows_relative_time() {
-        // Stub `generated_at` is 12:00:00Z; the passing run finished at
-        // 11:52:30Z (7m30s earlier) and the failing one at 11:44:10Z (15m50s).
+    fn human_commit_line_shows_relative_time() {
+        // Stub `generated_at` is 12:00:00Z; the green commit finished at
+        // 11:52:30Z (7m30s earlier) and the red one at 11:44:10Z (15m50s).
         let report = Report::stub(1);
         let out = human(&report, false, false);
-        assert!(out.contains("7m ago"), "passing run shows relative time");
-        assert!(out.contains("15m ago"), "failing run shows relative time");
+        assert!(out.contains("7m ago"), "green commit shows relative time");
+        assert!(out.contains("15m ago"), "red commit shows relative time");
     }
 
     #[test]
@@ -417,7 +455,7 @@ mod tests {
         let out = human(&report, false, false);
         assert!(
             out.contains("· failure"),
-            "non-success runs label the conclusion explicitly"
+            "red commits label the aggregate conclusion explicitly"
         );
     }
 
@@ -439,16 +477,15 @@ mod tests {
         let report = Report::stub(1);
         let expected = "\
 bbugyi200/actstat
-  ✔ CI · master · #42 · 2m30s · 7m ago
+  ✔ a1b2c3d Add list subcommand · master · 2m30s · 7m ago
 
 bbugyi200/dotfiles
-  ✘ CI · feature/shell · #128 · 4m10s · 15m ago · failure
-      ✘ test (3.14)
-          step 5: Run tests
-          https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003
-      https://github.com/bbugyi200/dotfiles/actions/runs/2002
-
-• sase-org/example  no completed runs
+  ✘ 9f8e7d6 Refactor shell init · master · 2 workflows · 4m10s · 15m ago · failure
+      ✘ CI · #128 · 4m10s · failure
+          ✘ test (3.14)
+              step 5: Run tests
+              https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003
+          https://github.com/bbugyi200/dotfiles/actions/runs/2002
 
 ✘ bobs-org/locked  403 Forbidden (token lacks access)
 ";
@@ -479,12 +516,12 @@ bbugyi200/dotfiles
     }
 
     #[test]
-    fn human_run_line_shows_duration() {
-        // Stub durations: actstat ran 150s (2m30s), dotfiles 250s (4m10s).
+    fn human_commit_line_shows_duration() {
+        // Stub commit durations: actstat 150s (2m30s), dotfiles 250s (4m10s).
         let report = Report::stub(1);
         let out = human(&report, false, false);
-        assert!(out.contains("2m30s"), "passing run shows its duration");
-        assert!(out.contains("4m10s"), "failing run shows its duration");
+        assert!(out.contains("2m30s"), "green commit shows its duration");
+        assert!(out.contains("4m10s"), "red commit shows its duration");
     }
 
     #[test]

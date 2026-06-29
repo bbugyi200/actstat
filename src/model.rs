@@ -1,6 +1,6 @@
 //! The single normalized result model that every output format renders from.
 //!
-//! `Report -> [RepoReport] -> [RunReport] -> [JobReport] -> [StepReport]`.
+//! `Report -> [RepoReport] -> [CommitReport] -> [RunReport] -> [JobReport] -> [StepReport]`.
 //! GitHub parsing (Phases 3–4) populates this tree; renderers (Phase 5) only
 //! ever read it. Phase 1 ships a deterministic [`Report::stub`] so all three
 //! output formats can be exercised end-to-end without any network access.
@@ -13,7 +13,8 @@ pub struct Report {
     /// When the report was generated (RFC3339). Stubbed deterministically in
     /// Phase 1 so output is reproducible in tests.
     pub generated_at: String,
-    /// The per-repository run limit that was requested (`-n/--limit`).
+    /// The per-repository settled-commit limit that was requested
+    /// (`-n/--limit`).
     pub limit: u32,
     /// Repositories, expected to be sorted alphabetically by `repo`.
     #[serde(rename = "repositories")]
@@ -25,13 +26,41 @@ pub struct Report {
 pub struct RepoReport {
     /// `owner/name`.
     pub repo: String,
-    /// The most-recent completed runs, newest first. Empty is a valid,
-    /// neutral state ("no completed runs").
-    pub runs: Vec<RunReport>,
+    /// The most-recent settled commits, newest first. Empty repos are
+    /// suppressed before rendering unless they carry an error.
+    pub commits: Vec<CommitReport>,
     /// A per-repository error (no access, Actions disabled, rate-limited, …).
     /// Present errors never abort the whole run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// A settled commit on a repository's default branch, with all workflow runs
+/// for that commit grouped below it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitReport {
+    /// Short (7-char) commit SHA.
+    pub sha: String,
+    /// Commit title / representative run display title.
+    pub title: String,
+    /// Default branch this commit was evaluated on.
+    pub branch: String,
+    /// Representative triggering event (`push`, `schedule`, …).
+    pub event: String,
+    /// Commit-level rollup: `success` when no run is an actionable problem,
+    /// `failure` otherwise.
+    pub conclusion: Conclusion,
+    /// Direct URL to the commit on github.com.
+    pub url: String,
+    /// Latest `updated_at` among the commit's completed runs.
+    pub finished_at: String,
+    /// Aggregate wall-clock duration in seconds (earliest run start → latest
+    /// run finish), omitted when any required timestamp is absent or malformed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<u64>,
+    /// All completed workflow runs for this commit. Problem runs carry failed
+    /// jobs/steps; non-problem runs have no jobs attached.
+    pub runs: Vec<RunReport>,
 }
 
 /// A single workflow run, normalized from the GitHub API.
@@ -62,7 +91,7 @@ pub struct RunReport {
     /// field is simply omitted rather than reported as a misleading zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<u64>,
-    /// Only *non-successful* jobs are attached; empty for passing runs.
+    /// Only problem jobs are attached; empty for non-problem runs.
     pub jobs: Vec<JobReport>,
 }
 
@@ -90,8 +119,9 @@ pub struct StepReport {
     pub conclusion: Conclusion,
 }
 
-/// Normalized workflow-run conclusion. `success` is the only passing variant;
-/// every other variant is rendered with its own label/icon.
+/// Normalized workflow-run conclusion. Commit aggregation treats `success`,
+/// `skipped`, and `neutral` as non-problem outcomes; every other variant is
+/// rendered with its own label/icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Conclusion {
@@ -116,9 +146,18 @@ pub enum Conclusion {
 }
 
 impl Conclusion {
-    /// Whether this conclusion counts as a passing run.
+    /// Whether this conclusion is literally GitHub `success`.
     pub fn is_success(&self) -> bool {
         matches!(self, Conclusion::Success)
+    }
+
+    /// Whether this conclusion is an actionable problem. Success, skipped, and
+    /// neutral are non-problem outcomes; everything else turns a commit red.
+    pub fn is_problem(&self) -> bool {
+        !matches!(
+            self,
+            Conclusion::Success | Conclusion::Skipped | Conclusion::Neutral
+        )
     }
 
     /// A short, stable, lower-case label for this conclusion.
@@ -173,21 +212,37 @@ impl Conclusion {
 }
 
 impl RunReport {
-    /// Whether this run is passing.
+    /// Whether this run is an actionable problem.
+    pub fn is_problem(&self) -> bool {
+        self.conclusion.is_problem()
+    }
+}
+
+impl CommitReport {
+    /// Compute the aggregate commit conclusion from normalized runs.
+    pub fn aggregate_conclusion(runs: &[RunReport]) -> Conclusion {
+        if runs.iter().any(RunReport::is_problem) {
+            Conclusion::Failure
+        } else {
+            Conclusion::Success
+        }
+    }
+
+    /// Whether the commit-level rollup is green.
     pub fn is_success(&self) -> bool {
         self.conclusion.is_success()
     }
 }
 
 impl RepoReport {
-    /// Whether this repository has any non-successful run.
+    /// Whether this repository has any red commit.
     pub fn has_failures(&self) -> bool {
-        self.runs.iter().any(|r| !r.is_success())
+        self.commits.iter().any(|c| !c.is_success())
     }
 }
 
 impl Report {
-    /// Whether any inspected run across all repositories was non-successful.
+    /// Whether any inspected commit across all repositories was red.
     /// Drives the `--fail-on-failure` exit code.
     pub fn has_failures(&self) -> bool {
         self.repos.iter().any(RepoReport::has_failures)
@@ -195,10 +250,10 @@ impl Report {
 
     /// Build a deterministic placeholder report (no network).
     ///
-    /// It intentionally covers every rendering path: a passing run, a failing
-    /// run with nested failed jobs/steps, a neutral "no runs" repository, and a
-    /// per-repository error — so all three output formats can be exercised end
-    /// to end in Phase 1.
+    /// It intentionally covers every rendering path: a green commit, a red
+    /// commit with a failed run plus a passing sibling run, and a per-repository
+    /// error — so all three output formats can be exercised end to end without
+    /// network access.
     pub fn stub(limit: u32) -> Self {
         Report {
             generated_at: "2026-06-29T12:00:00Z".to_string(),
@@ -206,60 +261,96 @@ impl Report {
             repos: vec![
                 RepoReport {
                     repo: "bbugyi200/actstat".to_string(),
-                    runs: vec![RunReport {
-                        workflow: "CI".to_string(),
-                        title: "Add list subcommand".to_string(),
-                        run_number: 42,
-                        event: "push".to_string(),
-                        branch: "master".to_string(),
+                    commits: vec![CommitReport {
                         sha: "a1b2c3d".to_string(),
+                        title: "Add list subcommand".to_string(),
+                        branch: "master".to_string(),
+                        event: "push".to_string(),
                         conclusion: Conclusion::Success,
-                        url: "https://github.com/bbugyi200/actstat/actions/runs/1001".to_string(),
-                        created_at: "2026-06-29T11:50:00Z".to_string(),
-                        updated_at: "2026-06-29T11:52:30Z".to_string(),
+                        url: "https://github.com/bbugyi200/actstat/commit/a1b2c3d4e5f67890"
+                            .to_string(),
+                        finished_at: "2026-06-29T11:52:30Z".to_string(),
                         // 11:50:00 → 11:52:30 = 150s.
                         duration_seconds: Some(150),
-                        jobs: vec![],
-                    }],
-                    error: None,
-                },
-                RepoReport {
-                    repo: "bbugyi200/dotfiles".to_string(),
-                    runs: vec![RunReport {
-                        workflow: "CI".to_string(),
-                        title: "Refactor shell init".to_string(),
-                        run_number: 128,
-                        event: "pull_request".to_string(),
-                        branch: "feature/shell".to_string(),
-                        sha: "9f8e7d6".to_string(),
-                        conclusion: Conclusion::Failure,
-                        url: "https://github.com/bbugyi200/dotfiles/actions/runs/2002".to_string(),
-                        created_at: "2026-06-29T11:40:00Z".to_string(),
-                        updated_at: "2026-06-29T11:44:10Z".to_string(),
-                        // 11:40:00 → 11:44:10 = 250s.
-                        duration_seconds: Some(250),
-                        jobs: vec![JobReport {
-                            name: "test (3.14)".to_string(),
-                            conclusion: Conclusion::Failure,
-                            url: "https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003"
+                        runs: vec![RunReport {
+                            workflow: "CI".to_string(),
+                            title: "Add list subcommand".to_string(),
+                            run_number: 42,
+                            event: "push".to_string(),
+                            branch: "master".to_string(),
+                            sha: "a1b2c3d".to_string(),
+                            conclusion: Conclusion::Success,
+                            url: "https://github.com/bbugyi200/actstat/actions/runs/1001"
                                 .to_string(),
-                            steps: vec![StepReport {
-                                name: "Run tests".to_string(),
-                                number: 5,
-                                conclusion: Conclusion::Failure,
-                            }],
+                            created_at: "2026-06-29T11:50:00Z".to_string(),
+                            updated_at: "2026-06-29T11:52:30Z".to_string(),
+                            duration_seconds: Some(150),
+                            jobs: vec![],
                         }],
                     }],
                     error: None,
                 },
                 RepoReport {
-                    repo: "sase-org/example".to_string(),
-                    runs: vec![],
+                    repo: "bbugyi200/dotfiles".to_string(),
+                    commits: vec![CommitReport {
+                        sha: "9f8e7d6".to_string(),
+                        title: "Refactor shell init".to_string(),
+                        branch: "master".to_string(),
+                        event: "push".to_string(),
+                        conclusion: Conclusion::Failure,
+                        url: "https://github.com/bbugyi200/dotfiles/commit/9f8e7d6c5b4a3210"
+                            .to_string(),
+                        finished_at: "2026-06-29T11:44:10Z".to_string(),
+                        // 11:40:00 → 11:44:10 = 250s.
+                        duration_seconds: Some(250),
+                        runs: vec![
+                            RunReport {
+                                workflow: "CI".to_string(),
+                                title: "Refactor shell init".to_string(),
+                                run_number: 128,
+                                event: "push".to_string(),
+                                branch: "master".to_string(),
+                                sha: "9f8e7d6".to_string(),
+                                conclusion: Conclusion::Failure,
+                                url: "https://github.com/bbugyi200/dotfiles/actions/runs/2002"
+                                    .to_string(),
+                                created_at: "2026-06-29T11:40:00Z".to_string(),
+                                updated_at: "2026-06-29T11:44:10Z".to_string(),
+                                duration_seconds: Some(250),
+                                jobs: vec![JobReport {
+                                    name: "test (3.14)".to_string(),
+                                    conclusion: Conclusion::Failure,
+                                    url: "https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003"
+                                        .to_string(),
+                                    steps: vec![StepReport {
+                                        name: "Run tests".to_string(),
+                                        number: 5,
+                                        conclusion: Conclusion::Failure,
+                                    }],
+                                }],
+                            },
+                            RunReport {
+                                workflow: "Deploy Docs".to_string(),
+                                title: "Refactor shell init".to_string(),
+                                run_number: 33,
+                                event: "push".to_string(),
+                                branch: "master".to_string(),
+                                sha: "9f8e7d6".to_string(),
+                                conclusion: Conclusion::Success,
+                                url: "https://github.com/bbugyi200/dotfiles/actions/runs/2003"
+                                    .to_string(),
+                                created_at: "2026-06-29T11:41:00Z".to_string(),
+                                updated_at: "2026-06-29T11:43:00Z".to_string(),
+                                duration_seconds: Some(120),
+                                jobs: vec![],
+                            },
+                        ],
+                    }],
                     error: None,
                 },
                 RepoReport {
                     repo: "bobs-org/locked".to_string(),
-                    runs: vec![],
+                    commits: vec![],
                     error: Some("403 Forbidden (token lacks access)".to_string()),
                 },
             ],
@@ -302,5 +393,47 @@ mod tests {
         );
         assert_eq!(Conclusion::from_github(None), Conclusion::Failure);
         assert!(!Conclusion::from_github(None).is_success());
+    }
+
+    #[test]
+    fn aggregate_conclusion_treats_skipped_and_neutral_as_green() {
+        let mut run = RunReport {
+            workflow: "CI".to_string(),
+            title: "No-op".to_string(),
+            run_number: 1,
+            event: "push".to_string(),
+            branch: "main".to_string(),
+            sha: "abcdef1".to_string(),
+            conclusion: Conclusion::Skipped,
+            url: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            duration_seconds: None,
+            jobs: vec![],
+        };
+        assert_eq!(
+            CommitReport::aggregate_conclusion(&[run.clone()]),
+            Conclusion::Success
+        );
+
+        run.conclusion = Conclusion::Neutral;
+        assert_eq!(
+            CommitReport::aggregate_conclusion(&[run.clone()]),
+            Conclusion::Success
+        );
+
+        run.conclusion = Conclusion::Failure;
+        assert_eq!(
+            CommitReport::aggregate_conclusion(&[run]),
+            Conclusion::Failure
+        );
+    }
+
+    #[test]
+    fn report_has_failures_folds_over_commits() {
+        let mut report = Report::stub(1);
+        assert!(report.has_failures());
+        report.repos.retain(|repo| repo.repo == "bbugyi200/actstat");
+        assert!(!report.has_failures());
     }
 }

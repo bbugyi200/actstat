@@ -1,5 +1,5 @@
-//! `actstat` — report the status of the most recent completed GitHub Actions
-//! workflow runs across a configured set of repositories.
+//! `actstat` — report recent settled GitHub Actions commit status across a
+//! configured set of repositories.
 //!
 //! The crate is split into a thin binary (`src/main.rs`) and this library so
 //! the logic is unit-testable without spawning a process or touching the
