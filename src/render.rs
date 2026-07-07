@@ -43,14 +43,8 @@ fn conclusion_style(conclusion: Conclusion) -> Style {
 }
 
 /// Pick a color for an active run status.
-fn status_style(status: RunStatus) -> Style {
-    match status {
-        RunStatus::InProgress => Style::new().cyan(),
-        RunStatus::Waiting => Style::new().yellow(),
-        RunStatus::Queued | RunStatus::Pending | RunStatus::Requested => {
-            Style::new().cyan().dimmed()
-        }
-    }
+fn status_style(_: RunStatus) -> Style {
+    Style::new().cyan()
 }
 
 /// Render the report as adaptive human-readable text.
@@ -118,7 +112,7 @@ pub fn human(report: &Report, use_color: bool, only_failures: bool) -> String {
     blocks.join("\n")
 }
 
-/// Render one active commit, always expanded to its in-flight runs.
+/// Render one active commit, always expanded to its running workflow run.
 fn render_active_commit(
     out: &mut String,
     commit: &ActiveCommitReport,
@@ -619,11 +613,9 @@ mod tests {
         let report = Report::stub(1);
         let expected = "\
 bbugyi200/actstat
-  ↻ f00ba12 Add progress spinner · master · 2 workflows · 1m20s · running
+  ↻ f00ba12 Add progress spinner · master · 1m20s · running
       ↻ CI · #44 · 1m20s · in_progress
           https://github.com/bbugyi200/actstat/actions/runs/1044
-      ⧖ Deploy Docs · #13 · queued
-          https://github.com/bbugyi200/actstat/actions/runs/1045
   ✔ a1b2c3d Add list subcommand · master · 2m30s · 7m ago
 
 bbugyi200/dotfiles

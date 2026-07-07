@@ -28,6 +28,7 @@
 //!    enriching their failed runs into a sorted list of [`RepoReport`]s ready for
 //!    any renderer.
 
+use std::cmp::Ordering;
 use std::future::Future;
 use std::time::Duration;
 
@@ -401,30 +402,30 @@ impl GitHubClient {
         Ok(commits)
     }
 
-    /// Fetch + normalize one repository's active workflow runs across all
-    /// branches, grouped by commit.
+    /// Fetch + normalize one repository's most recently started running
+    /// workflow run across all branches.
     async fn collect_active_commits(
         &self,
         repo: &RepoName,
     ) -> Result<Vec<ActiveCommitReport>, GitHubError> {
         let api_runs = self.fetch_active_runs(repo).await?;
-        Ok(select_active_commits(api_runs)
-            .into_iter()
+        Ok(select_most_recent_running_commit(api_runs)
             .map(|selected| build_active_commit_report(repo, selected))
+            .into_iter()
             .collect())
     }
 
-    /// Fetch one bounded window of recent workflow runs across all branches.
+    /// Fetch one bounded window of recent running workflow runs across all
+    /// branches.
     ///
-    /// The query is intentionally unfiltered so one call covers every
-    /// non-completed GitHub status without enumerating separate `status=`
-    /// requests.
+    /// The query intentionally omits `branch=` so pull request and feature
+    /// branch workflows are visible in the same running-run lookup.
     async fn fetch_active_runs(
         &self,
         repo: &RepoName,
     ) -> Result<Vec<ApiRun>, GitHubError> {
         let path = format!(
-            "/repos/{}/{}/actions/runs?per_page=100",
+            "/repos/{}/{}/actions/runs?status=in_progress&per_page=100",
             repo.owner, repo.name
         );
         let response: RunsResponse = self.get(&path).await?;
@@ -795,7 +796,7 @@ fn normalize_active_run(api: ApiRun) -> ActiveRunReport {
     }
 }
 
-/// A selected commit with its full SHA and deduplicated latest workflow runs.
+/// A selected commit with its full SHA and selected workflow runs.
 #[derive(Debug)]
 struct SelectedCommit {
     full_sha: String,
@@ -822,18 +823,34 @@ fn select_settled_commits(
     selected
 }
 
-/// Select every active commit from a newest-first run listing. Completed runs
-/// are dropped before grouping; active runs are not deduplicated because
-/// simultaneous queued/running runs of the same workflow are distinct work.
-fn select_active_commits(runs: Vec<ApiRun>) -> Vec<SelectedCommit> {
-    group_runs_by_sha(
-        runs.into_iter()
-            .filter(|run| !run_is_completed(run))
-            .collect(),
-    )
-    .into_iter()
-    .map(|(full_sha, runs)| SelectedCommit { full_sha, runs })
-    .collect()
+/// Select the most recently started running workflow run from a listing.
+///
+/// The GitHub request asks for `status=in_progress`, but this still filters
+/// defensively so queued/waiting/pending/requested/completed or malformed
+/// payloads never enter active output. Ties are resolved by highest run id, then
+/// by preserving the API's original order.
+fn select_most_recent_running_commit(
+    runs: Vec<ApiRun>,
+) -> Option<SelectedCommit> {
+    let mut best: Option<(usize, ApiRun)> = None;
+
+    for (index, run) in runs.into_iter().enumerate() {
+        if !run_is_in_progress(&run) {
+            continue;
+        }
+        let is_better = best.as_ref().is_none_or(|(best_index, best_run)| {
+            compare_running_runs(&run, index, best_run, *best_index)
+                == Ordering::Greater
+        });
+        if is_better {
+            best = Some((index, run));
+        }
+    }
+
+    best.map(|(_, run)| SelectedCommit {
+        full_sha: run.head_sha.clone().unwrap_or_default(),
+        runs: vec![run],
+    })
 }
 
 /// Group runs by full head SHA while preserving first-appearance order from
@@ -853,7 +870,7 @@ fn group_runs_by_sha(runs: Vec<ApiRun>) -> Vec<(String, Vec<ApiRun>)> {
     groups
 }
 
-/// Build one active commit report from a selected group of active runs.
+/// Build one active commit report from the selected running workflow run.
 fn build_active_commit_report(
     repo: &RepoName,
     selected: SelectedCommit,
@@ -873,7 +890,11 @@ fn build_active_commit_report(
         .iter()
         .find_map(|r| r.head_branch.clone())
         .unwrap_or_default();
-    let started_at = earliest_active_started_at(&selected.runs);
+    let started_at = selected
+        .runs
+        .first()
+        .map(active_started_at)
+        .unwrap_or_default();
     let short_sha: String = selected.full_sha.chars().take(7).collect();
     let url = format!(
         "https://github.com/{}/{}/commit/{}",
@@ -927,6 +948,43 @@ fn run_is_completed(run: &ApiRun) -> bool {
     run.status.as_deref() == Some("completed")
 }
 
+fn run_is_in_progress(run: &ApiRun) -> bool {
+    run.status.as_deref() == Some("in_progress")
+}
+
+fn compare_running_runs(
+    left: &ApiRun,
+    left_index: usize,
+    right: &ApiRun,
+    right_index: usize,
+) -> Ordering {
+    match (
+        running_started_timestamp(left),
+        running_started_timestamp(right),
+    ) {
+        (Some(left_ts), Some(right_ts)) if left_ts != right_ts => {
+            return left_ts.cmp(&right_ts);
+        }
+        (Some(_), None) => return Ordering::Greater,
+        (None, Some(_)) => return Ordering::Less,
+        _ => {}
+    }
+
+    match left.id.cmp(&right.id) {
+        Ordering::Equal => right_index.cmp(&left_index),
+        ordering => ordering,
+    }
+}
+
+fn running_started_timestamp(run: &ApiRun) -> Option<jiff::Timestamp> {
+    parse_timestamp(run.run_started_at.as_deref())
+        .or_else(|| parse_timestamp(run.created_at.as_deref()))
+}
+
+fn parse_timestamp(value: Option<&str>) -> Option<jiff::Timestamp> {
+    value.filter(|v| !v.is_empty())?.parse().ok()
+}
+
 fn latest_updated_at(runs: &[ApiRun]) -> String {
     let mut fallback: Option<&str> = None;
     let mut latest: Option<(&str, jiff::Timestamp)> = None;
@@ -951,36 +1009,20 @@ fn latest_updated_at(runs: &[ApiRun]) -> String {
         .unwrap_or_default()
 }
 
-/// Earliest known active start-ish timestamp across a commit's active runs.
+/// Best display timestamp for a selected running workflow run.
 ///
-/// GitHub may omit `run_started_at` for queued runs, so active commit elapsed
-/// time falls back to `created_at` for those runs. If every timestamp is
-/// malformed, preserve the first non-empty value rather than inventing one.
-fn earliest_active_started_at(runs: &[ApiRun]) -> String {
-    let mut fallback: Option<&str> = None;
-    let mut earliest: Option<(&str, jiff::Timestamp)> = None;
-
-    for run in runs {
-        let Some(value) = run
-            .run_started_at
-            .as_deref()
-            .or(run.created_at.as_deref())
-            .filter(|v| !v.is_empty())
-        else {
-            continue;
-        };
-        fallback.get_or_insert(value);
-        let Ok(timestamp) = value.parse::<jiff::Timestamp>() else {
-            continue;
-        };
-        if earliest.is_none_or(|(_, current)| timestamp < current) {
-            earliest = Some((value, timestamp));
-        }
+/// Prefer a parseable `run_started_at`, fall back to a parseable `created_at`,
+/// and preserve the first non-empty raw value only when neither parses.
+fn active_started_at(run: &ApiRun) -> String {
+    if parse_timestamp(run.run_started_at.as_deref()).is_some() {
+        return run.run_started_at.clone().unwrap_or_default();
     }
-
-    earliest
-        .map(|(value, _)| value.to_string())
-        .or_else(|| fallback.map(str::to_string))
+    if parse_timestamp(run.created_at.as_deref()).is_some() {
+        return run.created_at.clone().unwrap_or_default();
+    }
+    run.run_started_at
+        .clone()
+        .or_else(|| run.created_at.clone())
         .unwrap_or_default()
 }
 
@@ -1180,7 +1222,7 @@ pub struct ResolvedRepos {
 /// Successful collection result for one repository.
 #[derive(Debug, Clone, Default)]
 pub struct RepoStatus {
-    /// Active in-flight commits for the repository.
+    /// Active running commit for the repository, if one exists.
     pub active: Vec<ActiveCommitReport>,
     /// Settled commits for the repository.
     pub commits: Vec<CommitReport>,
@@ -1977,7 +2019,7 @@ mod tests {
             .await;
     }
 
-    /// Mount an all-branch active runs-listing response for `owner/name`.
+    /// Mount an all-branch running workflow-runs listing for `owner/name`.
     async fn mount_active_runs(
         server: &MockServer,
         owner: &str,
@@ -1986,9 +2028,9 @@ mod tests {
     ) {
         Mock::given(method("GET"))
             .and(path(format!("/repos/{owner}/{name}/actions/runs")))
+            .and(query_param("status", "in_progress"))
             .and(query_param("per_page", "100"))
             .and(query_param_is_missing("branch"))
-            .and(query_param_is_missing("status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
@@ -2054,7 +2096,7 @@ mod tests {
             event: Some("pull_request".into()),
             head_branch: Some("feature/x".into()),
             head_sha: Some("abcdef1234567890".into()),
-            status: Some("waiting".into()),
+            status: Some("in_progress".into()),
             conclusion: None,
             html_url: Some("https://example/run".into()),
             created_at: Some("2026-06-29T11:50:00Z".into()),
@@ -2066,7 +2108,7 @@ mod tests {
         assert_eq!(run.branch, "feature/x");
         assert_eq!(run.sha, "abcdef1", "head SHA is shortened to 7 chars");
         assert_eq!(run.run_number, 42);
-        assert_eq!(run.status, RunStatus::Waiting);
+        assert_eq!(run.status, RunStatus::InProgress);
         assert_eq!(run.created_at, "2026-06-29T11:50:00Z");
         assert_eq!(run.started_at.as_deref(), Some("2026-06-29T11:51:00Z"));
     }
@@ -2273,30 +2315,132 @@ mod tests {
         );
     }
 
+    fn running_api_run(
+        id: u64,
+        sha: &str,
+        run_started_at: Option<&str>,
+        created_at: Option<&str>,
+    ) -> ApiRun {
+        let mut run = api_run(id, id, sha, "in_progress", None);
+        run.run_started_at = run_started_at.map(str::to_string);
+        run.created_at = created_at.map(str::to_string);
+        run
+    }
+
     #[test]
-    fn select_active_commits_groups_non_completed_runs_newest_first() {
+    fn select_running_commit_ignores_every_non_running_status() {
+        let runs = [
+            "queued",
+            "waiting",
+            "pending",
+            "requested",
+            "completed",
+            "success",
+            "failure",
+            "cancelled",
+            "unknown",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, status)| {
+            api_run(index as u64 + 1, 1, status, status, None)
+        })
+        .collect();
+
+        let selected = select_most_recent_running_commit(runs);
+
+        assert!(
+            selected.is_none(),
+            "only status=in_progress may enter active output"
+        );
+    }
+
+    #[test]
+    fn select_running_commit_returns_none_without_in_progress_runs() {
+        let selected = select_most_recent_running_commit(vec![
+            api_run(1, 1, "queued", "queued", None),
+            api_run(2, 1, "completed", "completed", Some("success")),
+        ]);
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_running_commit_chooses_greatest_run_started_at() {
         let runs = vec![
-            api_run(5, 1, "newest", "queued", None),
-            api_run(4, 1, "settled", "completed", Some("success")),
-            api_run(3, 1, "older", "in_progress", None),
-            api_run(2, 2, "newest", "waiting", None),
+            running_api_run(
+                1,
+                "api-first",
+                Some("2026-06-29T11:58:00Z"),
+                Some("2026-06-29T11:57:00Z"),
+            ),
+            running_api_run(
+                2,
+                "newer-start",
+                Some("2026-06-29T11:59:00Z"),
+                Some("2026-06-29T11:56:00Z"),
+            ),
         ];
 
-        let selected = select_active_commits(runs);
+        let selected = select_most_recent_running_commit(runs).unwrap();
 
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].full_sha, "newest");
-        assert_eq!(
-            selected[0]
-                .runs
-                .iter()
-                .map(|run| run.id)
-                .collect::<Vec<_>>(),
-            vec![5, 2],
-            "duplicate active workflow runs are preserved"
-        );
-        assert_eq!(selected[1].full_sha, "older");
-        assert_eq!(selected[1].runs.len(), 1);
+        assert_eq!(selected.full_sha, "newer-start");
+        assert_eq!(selected.runs.len(), 1);
+        assert_eq!(selected.runs[0].id, 2);
+    }
+
+    #[test]
+    fn select_running_commit_falls_back_to_created_at() {
+        let runs = vec![
+            running_api_run(
+                1,
+                "started",
+                Some("2026-06-29T11:59:00Z"),
+                Some("2026-06-29T11:57:00Z"),
+            ),
+            running_api_run(
+                2,
+                "created-fallback",
+                None,
+                Some("2026-06-29T12:00:00Z"),
+            ),
+        ];
+
+        let selected = select_most_recent_running_commit(runs).unwrap();
+
+        assert_eq!(selected.full_sha, "created-fallback");
+        assert_eq!(selected.runs[0].id, 2);
+    }
+
+    #[test]
+    fn select_running_commit_uses_highest_id_for_tied_timestamps() {
+        let runs = vec![
+            running_api_run(10, "lower-id", Some("2026-06-29T11:59:00Z"), None),
+            running_api_run(
+                12,
+                "higher-id",
+                Some("2026-06-29T11:59:00Z"),
+                None,
+            ),
+        ];
+
+        let selected = select_most_recent_running_commit(runs).unwrap();
+
+        assert_eq!(selected.full_sha, "higher-id");
+        assert_eq!(selected.runs[0].id, 12);
+    }
+
+    #[test]
+    fn select_running_commit_preserves_api_order_as_final_tie_breaker() {
+        let runs = vec![
+            running_api_run(10, "api-first", Some("not-a-time"), None),
+            running_api_run(10, "api-second", Some("also-bad"), None),
+        ];
+
+        let selected = select_most_recent_running_commit(runs).unwrap();
+
+        assert_eq!(selected.full_sha, "api-first");
+        assert_eq!(selected.runs.len(), 1);
     }
 
     // --- Commit collection (mocked HTTP) --------------------------------
@@ -2522,13 +2666,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_fetch_sends_per_page_with_no_branch_or_status() {
+    async fn active_fetch_sends_status_per_page_with_no_branch() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/actions/runs"))
+            .and(query_param("status", "in_progress"))
             .and(query_param("per_page", "100"))
             .and(query_param_is_missing("branch"))
-            .and(query_param_is_missing("status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(
                 vec![active_run_json_with(
                     44,
@@ -2600,13 +2744,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_only_repo_returns_active_with_no_settled_commits() {
+    async fn queued_only_repo_returns_no_active_with_no_settled_commits() {
         let server = MockServer::start().await;
-        mount_repo_detail(&server, "o", "active-only", "main").await;
+        mount_repo_detail(&server, "o", "queued-only", "main").await;
         mount_active_runs(
             &server,
             "o",
-            "active-only",
+            "queued-only",
             runs_body(vec![active_run_json_with(
                 44,
                 1,
@@ -2621,7 +2765,7 @@ mod tests {
         mount_runs(
             &server,
             "o",
-            "active-only",
+            "queued-only",
             runs_body(vec![run_json_with(
                 44,
                 1,
@@ -2636,29 +2780,29 @@ mod tests {
         let client = test_client(&server.uri());
         let reports = collect_repo_reports(
             &client,
-            vec![repo("o", "active-only")],
+            vec![repo("o", "queued-only")],
             1,
             8,
             true,
         )
         .await;
 
-        assert_eq!(reports[0].active.len(), 1);
+        assert!(reports[0].active.is_empty());
         assert!(reports[0].commits.is_empty());
         assert!(reports[0].error.is_none());
     }
 
     #[tokio::test]
-    async fn no_active_collection_issues_no_unfiltered_runs_request() {
+    async fn no_active_collection_issues_no_running_runs_request() {
         let server = MockServer::start().await;
         mount_repo_detail(&server, "o", "r", "main").await;
         mount_runs(&server, "o", "r", runs_body(vec![run_json(1, "success")]))
             .await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/actions/runs"))
+            .and(query_param("status", "in_progress"))
             .and(query_param("per_page", "100"))
             .and(query_param_is_missing("branch"))
-            .and(query_param_is_missing("status"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(runs_body(vec![])),
             )
@@ -2683,9 +2827,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/actions/runs"))
+            .and(query_param("status", "in_progress"))
             .and(query_param("per_page", "100"))
             .and(query_param_is_missing("branch"))
-            .and(query_param_is_missing("status"))
             .respond_with(
                 ResponseTemplate::new(404).set_body_json(
                     serde_json::json!({ "message": "Not Found" }),

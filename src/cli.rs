@@ -74,7 +74,7 @@ pub struct ListArgs {
     #[arg(long)]
     pub only_failures: bool,
 
-    /// Skip fetching and showing in-flight workflow runs.
+    /// Skip fetching and showing the currently running workflow run.
     #[arg(long)]
     pub no_active: bool,
 
@@ -229,7 +229,7 @@ async fn run_list(args: ListArgs) -> ExitCode {
     if args.verbose > 0 && !args.quiet {
         let _ = writeln!(
             std::io::stderr(),
-            "actstat: inspecting {} repositor{} (settled-commit limit={}, active-runs={}, concurrency={})",
+            "actstat: inspecting {} repositor{} (settled-commit limit={}, running-run lookup={}, concurrency={})",
             repos.len(),
             if repos.len() == 1 { "y" } else { "ies" },
             args.limit,

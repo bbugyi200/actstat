@@ -2,17 +2,16 @@
 
 [![CI](https://github.com/bbugyi200/actstat/actions/workflows/ci.yml/badge.svg)](https://github.com/bbugyi200/actstat/actions/workflows/ci.yml)
 
-A fast, beautiful Rust CLI that reports in-flight GitHub Actions runs plus the
-status of the most recent settled default-branch commits across a configured set
-of repositories.
+A fast, beautiful Rust CLI that reports the currently running GitHub Actions run
+plus the status of the most recent settled default-branch commits across a
+configured set of repositories.
 
 `actstat` answers one question quickly: **which of my projects are healthy, and
-what is running, which projects are healthy, and what broke most recently?**
-Queued/running commits appear live above the settled history. A green commit
-collapses to a single compact line; a red commit expands into every failed
-workflow run, failed job, and failed step with direct links to the broken logs.
-Output is grouped by repository, quiet about success, and loud and detailed
-about failure.
+what is running, and what broke most recently?** A currently running commit
+appears live above the settled history. A green commit collapses to a single
+compact line; a red commit expands into every failed workflow run, failed job,
+and failed step with direct links to the broken logs. Output is grouped by
+repository, quiet about success, and loud and detailed about failure.
 
 It is built to be comfortable as an interactive terminal command **and**
 dependable inside cronjobs and scripts: async fan-out across repositories, a
@@ -24,8 +23,8 @@ broken repository never aborts the run), and stable machine-readable output
 
 - **Compact when healthy, detailed when not.** Green commits are one line; red
   commits expand to failed runs → failed jobs → failed steps → GitHub URLs.
-- **Live in-flight runs.** Queued, running, and waiting workflow runs are shown
-  above settled commits with direct links to the live run logs.
+- **Live running workflow.** The most recently started `in_progress` workflow
+  run is shown above settled commits with a direct link to the live run log.
 - **Resilient.** A repo with no access, disabled Actions, or a rate limit becomes
   an inline error row instead of crashing the run.
 - **Scriptable.** `--format json` / `--format jsonl` emit stable, deterministic
@@ -160,7 +159,7 @@ Running `actstat` with no subcommand behaves exactly like `actstat list`, and th
 | `-c, --config <PATH>` | Explicit config path (overrides discovery). | discovery |
 | `--color <auto\|always\|never>` | Color control; also honors `NO_COLOR`. | `auto` |
 | `--only-failures` | Show only red commits in **human** output. | off |
-| `--no-active` | Skip fetching and showing in-flight queued/running workflow runs. | off |
+| `--no-active` | Skip fetching and showing the currently running workflow run. | off |
 | `--repo <OWNER/NAME>` | Restrict to a subset of configured repos (repeatable). | all |
 | `--concurrency <N>` | Max repositories fetched concurrently. | `8` |
 | `--fail-on-failure` | Exit non-zero if any inspected commit is red. | off |
@@ -176,7 +175,7 @@ include every shown commit so machine consumers can do their own filtering.
 actstat                              # status of the latest settled commit per repo
 actstat -n 5                         # inspect the 5 most recent settled commits each
 actstat --only-failures              # show only what's broken
-actstat --no-active                  # skip live in-flight run lookup
+actstat --no-active                  # skip running workflow lookup
 actstat --repo bbugyi200/actstat     # just one repo, ignoring the rest of the config
 actstat -f json | jq '.repositories[].active'
 actstat --fail-on-failure -q         # quiet gate for cron/CI (see exit codes below)
@@ -186,23 +185,22 @@ actstat --fail-on-failure -q         # quiet gate for cron/CI (see exit codes be
 
 ### Human (default)
 
-Repositories are grouped and sorted alphabetically. Active commits with
-non-completed workflow runs appear first, grouped by commit and always expanded
-to their live run URLs. Settled commits follow newest first on each repository's
-default branch. A green commit is one compact line (icon · short SHA · title ·
-branch · duration · relative time). A red commit keeps that summary, appends its
-aggregate conclusion label, and expands into the failed workflow runs, their
-failed jobs, failed steps, and direct GitHub URLs. Repositories with no active or
-settled commits are omitted; repositories that error still show a clear error
-row.
+Repositories are grouped and sorted alphabetically. If a repository has running
+workflow runs, the most recently started `in_progress` run appears first,
+wrapped in the existing active commit shape and expanded to its live run URL.
+Settled commits follow newest first on each repository's default branch. A green
+commit is one compact line (icon · short SHA · title · branch · duration ·
+relative time). A red commit keeps that summary, appends its aggregate
+conclusion label, and expands into the failed workflow runs, their failed jobs,
+failed steps, and direct GitHub URLs. Repositories with no currently running
+workflow run or settled commits are omitted; repositories that error still show
+a clear error row.
 
 ```text
 bbugyi200/actstat
-  ↻ f00ba12 Add progress spinner · master · 2 workflows · 1m20s · running
+  ↻ f00ba12 Add progress spinner · master · 1m20s · running
       ↻ CI · #44 · 1m20s · in_progress
           https://github.com/bbugyi200/actstat/actions/runs/1044
-      ⧖ Deploy Docs · #13 · queued
-          https://github.com/bbugyi200/actstat/actions/runs/1045
   ✔ a1b2c3d Add list subcommand · master · 2m30s · 7m ago
 
 bbugyi200/dotfiles
@@ -218,10 +216,10 @@ bbugyi200/dotfiles
 
 Reading the example:
 
-- `bbugyi200/actstat` — a newer `master` commit is still in flight: `CI` has
-  been running for `1m20s`, `Deploy Docs` is queued, and both link to their live
-  run logs. Below it, the latest settled `master` commit passed; its workflow
-  group took `2m30s` and finished `7m ago`.
+- `bbugyi200/actstat` — a newer `master` commit is running: `CI` has been
+  running for `1m20s` and links to its live run log. Below it, the latest
+  settled `master` commit passed; its workflow group took `2m30s` and finished
+  `7m ago`.
 - `bbugyi200/dotfiles` — latest settled `master` commit is red because `CI`
   failed; `Deploy Docs` passed on the same commit, so the commit shows
   `2 workflows`. The failed job `test (3.14)` failed at `step 5: Run tests`,
@@ -233,18 +231,18 @@ Color is adaptive: on by default when stdout is a TTY, off when piped, when
 layout is unchanged and byte-clean (no escape codes), so it diffs and greps
 cleanly.
 
-`--only-failures` hides active commits in the human view because in-flight runs
-are not failures. Machine formats still include active data for consumers that
-want to handle it explicitly.
+`--only-failures` hides active commits in the human view because running
+workflow runs are not failures. Machine formats still include active data for
+consumers that want to handle it explicitly.
 
 ### JSON (`--format json`)
 
 A single pretty-printed document: top-level metadata plus a `repositories` array.
 Each repo always carries an `active` array, then its settled `commits` (and an
-`error` field only when it failed). Active commits carry their non-completed
-`runs` with a `status`; settled commits carry completed `runs`, and each problem
-run carries failed `jobs` and failed `steps`. Output is deterministic for
-deterministic input.
+`error` field only when it failed). Active commits carry exactly one `runs`
+entry with `status: "in_progress"`; settled commits carry completed `runs`, and
+each problem run carries failed `jobs` and failed `steps`. Output is
+deterministic for deterministic input.
 
 ```json
 {
@@ -273,18 +271,6 @@ deterministic input.
               "url": "https://github.com/bbugyi200/actstat/actions/runs/1044",
               "created_at": "2026-06-29T11:58:35Z",
               "started_at": "2026-06-29T11:58:40Z"
-            },
-            {
-              "workflow": "Deploy Docs",
-              "title": "Add progress spinner",
-              "run_number": 13,
-              "event": "push",
-              "branch": "master",
-              "sha": "f00ba12",
-              "status": "queued",
-              "url": "https://github.com/bbugyi200/actstat/actions/runs/1045",
-              "created_at": "2026-06-29T11:58:50Z",
-              "started_at": null
             }
           ]
         }
@@ -391,18 +377,18 @@ deterministic input.
 
 One JSON record per line for easy `jq`/shell piping. Every line carries a `type`
 (`active_commit`, `commit`, or `repo_error`) and the `repo` it belongs to: one
-`active_commit` record per active commit, one `commit` record per settled commit,
+`active_commit` record per repo at most, one `commit` record per settled commit,
 plus one `repo_error` record per errored repository. Active commit records are
 emitted before settled commit records for the same repo.
 
 ```jsonl
-{"branch":"master","event":"push","repo":"bbugyi200/actstat","runs":[{"branch":"master","created_at":"2026-06-29T11:58:35Z","event":"push","run_number":44,"sha":"f00ba12","started_at":"2026-06-29T11:58:40Z","status":"in_progress","title":"Add progress spinner","url":"https://github.com/bbugyi200/actstat/actions/runs/1044","workflow":"CI"},{"branch":"master","created_at":"2026-06-29T11:58:50Z","event":"push","run_number":13,"sha":"f00ba12","started_at":null,"status":"queued","title":"Add progress spinner","url":"https://github.com/bbugyi200/actstat/actions/runs/1045","workflow":"Deploy Docs"}],"sha":"f00ba12","started_at":"2026-06-29T11:58:40Z","title":"Add progress spinner","type":"active_commit","url":"https://github.com/bbugyi200/actstat/commit/f00ba1234567890"}
+{"branch":"master","event":"push","repo":"bbugyi200/actstat","runs":[{"branch":"master","created_at":"2026-06-29T11:58:35Z","event":"push","run_number":44,"sha":"f00ba12","started_at":"2026-06-29T11:58:40Z","status":"in_progress","title":"Add progress spinner","url":"https://github.com/bbugyi200/actstat/actions/runs/1044","workflow":"CI"}],"sha":"f00ba12","started_at":"2026-06-29T11:58:40Z","title":"Add progress spinner","type":"active_commit","url":"https://github.com/bbugyi200/actstat/commit/f00ba1234567890"}
 {"branch":"master","conclusion":"success","duration_seconds":150,"event":"push","finished_at":"2026-06-29T11:52:30Z","repo":"bbugyi200/actstat","runs":[{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:50:00Z","duration_seconds":150,"event":"push","jobs":[],"run_number":42,"sha":"a1b2c3d","title":"Add list subcommand","updated_at":"2026-06-29T11:52:30Z","url":"https://github.com/bbugyi200/actstat/actions/runs/1001","workflow":"CI"}],"sha":"a1b2c3d","title":"Add list subcommand","type":"commit","url":"https://github.com/bbugyi200/actstat/commit/a1b2c3d4e5f67890"}
 {"branch":"master","conclusion":"failure","duration_seconds":250,"event":"push","finished_at":"2026-06-29T11:44:10Z","repo":"bbugyi200/dotfiles","runs":[{"branch":"master","conclusion":"failure","created_at":"2026-06-29T11:40:00Z","duration_seconds":250,"event":"push","jobs":[{"conclusion":"failure","name":"test (3.14)","steps":[{"conclusion":"failure","name":"Run tests","number":5}],"url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003"}],"run_number":128,"sha":"9f8e7d6","title":"Refactor shell init","updated_at":"2026-06-29T11:44:10Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002","workflow":"CI"},{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:41:00Z","duration_seconds":120,"event":"push","jobs":[],"run_number":33,"sha":"9f8e7d6","title":"Refactor shell init","updated_at":"2026-06-29T11:43:00Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2003","workflow":"Deploy Docs"}],"sha":"9f8e7d6","title":"Refactor shell init","type":"commit","url":"https://github.com/bbugyi200/dotfiles/commit/9f8e7d6c5b4a3210"}
 {"error":"403 Forbidden (token lacks access)","repo":"bobs-org/locked","type":"repo_error"}
 ```
 
-For example, to list every live active run URL:
+For example, to list every live running workflow URL:
 
 ```sh
 actstat -f jsonl | jq -r 'select(.type=="active_commit") | .runs[].url'
@@ -415,14 +401,13 @@ to **stderr**, so `actstat list -f json` is always pipe-clean.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Ran to completion. Commit conclusions are reported, **not** gated — a red commit alone does not change the exit code. Active runs never change the exit code. |
+| `0` | Ran to completion. Commit conclusions are reported, **not** gated — a red commit alone does not change the exit code. Running workflow runs never change the exit code. |
 | `1` | Operational error: no usable config, config parse error, every inspected repository errored, or a fatal client/runtime error. |
 | `2` | `--fail-on-failure` is set and at least one inspected commit was red. Also returned for a usage error such as a malformed `--repo OWNER/NAME` value. |
 
 By default `actstat` reports without gating (exit `0`); pass `--fail-on-failure`
-to turn a red settled commit into a non-zero exit for cron/CI. Queued, running,
-waiting, pending, and requested runs are in flight, not failures, so they never
-trigger exit `2`.
+to turn a red settled commit into a non-zero exit for cron/CI. A running
+workflow has not failed or passed yet, so it never triggers exit `2`.
 
 ## Cronjob recipe
 
@@ -462,16 +447,17 @@ monitor can distinguish a broken pipeline from a broken check.
 - **A repository shows an error row (`403`/`404`)** — the token can't see it, or
   it doesn't exist. This is isolated per repository and never aborts the run; the
   rest of your projects still report.
-- **A repo is missing from output** — it had no active runs and no qualifying
-  settled commits in the recent default-branch run window. Empty repos are
-  omitted rather than shown as neutral rows.
-- **The newest GitHub commit is absent** — by default, it should appear as an
-  active commit while its runs are queued, running, waiting, pending, or
-  requested. If you pass `--no-active`, in-flight commits are skipped and the
-  command falls back to settled commits only. Active detection uses one
-  unfiltered `per_page=100` runs request per repo, so a very old active run can
-  be missed if it has fallen outside GitHub's newest 100 run records for that
-  repo.
+- **A repo is missing from output** — it had no currently running workflow run
+  and no qualifying settled commits in the recent default-branch run window.
+  Empty repos are omitted rather than shown as neutral rows.
+- **A workflow is queued but not shown** — queued, waiting, pending, and
+  requested runs are not considered active. Once GitHub marks a workflow run
+  `in_progress`, the most recently started running workflow appears unless
+  `--no-active` is used.
+- **The newest GitHub commit is absent** — if it has no `in_progress` workflow
+  run and no settled default-branch run yet, it is omitted. The running-run
+  lookup is bounded to the newest 100 `in_progress` records returned by GitHub
+  for that repo.
 - **Use `-v` to diagnose** — add `--verbose` to print the token source and how
   many repositories are being inspected (on stderr, so stdout stays clean).
 

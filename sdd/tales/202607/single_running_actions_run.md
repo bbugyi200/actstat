@@ -1,6 +1,6 @@
 ---
 create_time: 2026-07-07 11:59:48
-status: wip
+status: done
 prompt: sdd/prompts/202607/single_running_actions_run.md
 ---
 # Plan: Show only the most recently started running GitHub Actions run
