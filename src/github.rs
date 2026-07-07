@@ -40,7 +40,8 @@ use thiserror::Error;
 
 use crate::config::{resolve_repos, Config, OrgSource, RepoName};
 use crate::model::{
-    CommitReport, Conclusion, JobReport, RepoReport, RunReport, StepReport,
+    ActiveCommitReport, ActiveRunReport, CommitReport, Conclusion, JobReport,
+    RepoReport, RunReport, RunStatus, StepReport,
 };
 
 /// The real GitHub REST API base URL.
@@ -400,6 +401,36 @@ impl GitHubClient {
         Ok(commits)
     }
 
+    /// Fetch + normalize one repository's active workflow runs across all
+    /// branches, grouped by commit.
+    async fn collect_active_commits(
+        &self,
+        repo: &RepoName,
+    ) -> Result<Vec<ActiveCommitReport>, GitHubError> {
+        let api_runs = self.fetch_active_runs(repo).await?;
+        Ok(select_active_commits(api_runs)
+            .into_iter()
+            .map(|selected| build_active_commit_report(repo, selected))
+            .collect())
+    }
+
+    /// Fetch one bounded window of recent workflow runs across all branches.
+    ///
+    /// The query is intentionally unfiltered so one call covers every
+    /// non-completed GitHub status without enumerating separate `status=`
+    /// requests.
+    async fn fetch_active_runs(
+        &self,
+        repo: &RepoName,
+    ) -> Result<Vec<ApiRun>, GitHubError> {
+        let path = format!(
+            "/repos/{}/{}/actions/runs?per_page=100",
+            repo.owner, repo.name
+        );
+        let response: RunsResponse = self.get(&path).await?;
+        Ok(response.workflow_runs)
+    }
+
     /// Resolve a repository's default branch.
     async fn repo_default_branch(
         &self,
@@ -745,6 +776,25 @@ fn normalize_run(api: ApiRun) -> (u64, RunReport) {
     (api.id, report)
 }
 
+/// Normalize one API run into an [`ActiveRunReport`]. The head SHA is shortened
+/// to 7 characters and the GitHub `status` is mapped to [`RunStatus`].
+fn normalize_active_run(api: ApiRun) -> ActiveRunReport {
+    let sha: String =
+        api.head_sha.unwrap_or_default().chars().take(7).collect();
+    ActiveRunReport {
+        workflow: api.name.unwrap_or_default(),
+        title: api.display_title.unwrap_or_default(),
+        run_number: api.run_number,
+        event: api.event.unwrap_or_default(),
+        branch: api.head_branch.unwrap_or_default(),
+        sha,
+        status: RunStatus::from_github(api.status.as_deref()),
+        url: api.html_url.unwrap_or_default(),
+        created_at: api.created_at.unwrap_or_default(),
+        started_at: api.run_started_at,
+    }
+}
+
 /// A selected commit with its full SHA and deduplicated latest workflow runs.
 #[derive(Debug)]
 struct SelectedCommit {
@@ -759,6 +809,36 @@ fn select_settled_commits(
     runs: Vec<ApiRun>,
     limit: u32,
 ) -> Vec<SelectedCommit> {
+    let mut selected = Vec::new();
+    for (full_sha, runs) in group_runs_by_sha(runs) {
+        let runs = dedupe_latest_runs_per_workflow(runs);
+        if runs.iter().all(run_is_completed) {
+            selected.push(SelectedCommit { full_sha, runs });
+            if selected.len() >= limit as usize {
+                break;
+            }
+        }
+    }
+    selected
+}
+
+/// Select every active commit from a newest-first run listing. Completed runs
+/// are dropped before grouping; active runs are not deduplicated because
+/// simultaneous queued/running runs of the same workflow are distinct work.
+fn select_active_commits(runs: Vec<ApiRun>) -> Vec<SelectedCommit> {
+    group_runs_by_sha(
+        runs.into_iter()
+            .filter(|run| !run_is_completed(run))
+            .collect(),
+    )
+    .into_iter()
+    .map(|(full_sha, runs)| SelectedCommit { full_sha, runs })
+    .collect()
+}
+
+/// Group runs by full head SHA while preserving first-appearance order from
+/// GitHub's newest-first listing.
+fn group_runs_by_sha(runs: Vec<ApiRun>) -> Vec<(String, Vec<ApiRun>)> {
     let mut groups: Vec<(String, Vec<ApiRun>)> = Vec::new();
     for run in runs {
         let full_sha = run.head_sha.clone().unwrap_or_default();
@@ -770,18 +850,50 @@ fn select_settled_commits(
             groups.push((full_sha, vec![run]));
         }
     }
+    groups
+}
 
-    let mut selected = Vec::new();
-    for (full_sha, runs) in groups {
-        let runs = dedupe_latest_runs_per_workflow(runs);
-        if runs.iter().all(run_is_completed) {
-            selected.push(SelectedCommit { full_sha, runs });
-            if selected.len() >= limit as usize {
-                break;
-            }
-        }
+/// Build one active commit report from a selected group of active runs.
+fn build_active_commit_report(
+    repo: &RepoName,
+    selected: SelectedCommit,
+) -> ActiveCommitReport {
+    let title = selected
+        .runs
+        .iter()
+        .find_map(|r| r.display_title.clone())
+        .unwrap_or_default();
+    let event = selected
+        .runs
+        .iter()
+        .find_map(|r| r.event.clone())
+        .unwrap_or_default();
+    let branch = selected
+        .runs
+        .iter()
+        .find_map(|r| r.head_branch.clone())
+        .unwrap_or_default();
+    let started_at = earliest_active_started_at(&selected.runs);
+    let short_sha: String = selected.full_sha.chars().take(7).collect();
+    let url = format!(
+        "https://github.com/{}/{}/commit/{}",
+        repo.owner, repo.name, selected.full_sha
+    );
+    let runs = selected
+        .runs
+        .into_iter()
+        .map(normalize_active_run)
+        .collect();
+
+    ActiveCommitReport {
+        sha: short_sha,
+        title,
+        branch,
+        event,
+        url,
+        started_at,
+        runs,
     }
-    selected
 }
 
 /// Collapse repeated attempts of the same workflow to the highest run id.
@@ -834,6 +946,39 @@ fn latest_updated_at(runs: &[ApiRun]) -> String {
     }
 
     latest
+        .map(|(value, _)| value.to_string())
+        .or_else(|| fallback.map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// Earliest known active start-ish timestamp across a commit's active runs.
+///
+/// GitHub may omit `run_started_at` for queued runs, so active commit elapsed
+/// time falls back to `created_at` for those runs. If every timestamp is
+/// malformed, preserve the first non-empty value rather than inventing one.
+fn earliest_active_started_at(runs: &[ApiRun]) -> String {
+    let mut fallback: Option<&str> = None;
+    let mut earliest: Option<(&str, jiff::Timestamp)> = None;
+
+    for run in runs {
+        let Some(value) = run
+            .run_started_at
+            .as_deref()
+            .or(run.created_at.as_deref())
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        fallback.get_or_insert(value);
+        let Ok(timestamp) = value.parse::<jiff::Timestamp>() else {
+            continue;
+        };
+        if earliest.is_none_or(|(_, current)| timestamp < current) {
+            earliest = Some((value, timestamp));
+        }
+    }
+
+    earliest
         .map(|(value, _)| value.to_string())
         .or_else(|| fallback.map(str::to_string))
         .unwrap_or_default()
@@ -1032,6 +1177,24 @@ pub struct ResolvedRepos {
     pub org_errors: Vec<(String, String)>,
 }
 
+/// Successful collection result for one repository.
+#[derive(Debug, Clone, Default)]
+pub struct RepoStatus {
+    /// Active in-flight commits for the repository.
+    pub active: Vec<ActiveCommitReport>,
+    /// Settled commits for the repository.
+    pub commits: Vec<CommitReport>,
+}
+
+impl From<Vec<CommitReport>> for RepoStatus {
+    fn from(commits: Vec<CommitReport>) -> Self {
+        RepoStatus {
+            active: vec![],
+            commits,
+        }
+    }
+}
+
 /// Expand every org in `config` (with bounded concurrency) and merge the
 /// results with the explicitly-listed repos through [`resolve_repos`], yielding
 /// one de-duplicated, sorted `owner/name` list.
@@ -1084,7 +1247,7 @@ pub async fn fetch_repo_reports<F, Fut>(
 ) -> Vec<RepoReport>
 where
     F: Fn(RepoName) -> Fut,
-    Fut: Future<Output = Result<Vec<CommitReport>, GitHubError>>,
+    Fut: Future<Output = Result<RepoStatus, GitHubError>>,
 {
     let mut reports: Vec<RepoReport> =
         futures::stream::iter(repos.into_iter().map(|repo| {
@@ -1092,13 +1255,15 @@ where
             async move {
                 let name = repo.full_name();
                 match fut.await {
-                    Ok(commits) => RepoReport {
+                    Ok(status) => RepoReport {
                         repo: name,
-                        commits,
+                        active: status.active,
+                        commits: status.commits,
                         error: None,
                     },
                     Err(e) => RepoReport {
                         repo: name,
+                        active: vec![],
                         commits: vec![],
                         error: Some(e.to_string()),
                     },
@@ -1136,10 +1301,26 @@ pub async fn collect_repo_reports(
     repos: Vec<RepoName>,
     limit: u32,
     concurrency: usize,
+    include_active: bool,
 ) -> Vec<RepoReport> {
     fetch_repo_reports(repos, concurrency, |repo| {
         let client = client.clone();
-        async move { client.collect_commits(&repo, limit).await }
+        async move {
+            if include_active {
+                let active = client.collect_active_commits(&repo);
+                let commits = client.collect_commits(&repo, limit);
+                let (active, commits) = tokio::join!(active, commits);
+                Ok(RepoStatus {
+                    active: active?,
+                    commits: commits?,
+                })
+            } else {
+                Ok(RepoStatus {
+                    active: vec![],
+                    commits: client.collect_commits(&repo, limit).await?,
+                })
+            }
+        }
     })
     .await
 }
@@ -1573,7 +1754,7 @@ mod tests {
             if r.name == "b" {
                 Err(GitHubError::Forbidden("nope".into()))
             } else {
-                Ok(vec![])
+                Ok(RepoStatus::default())
             }
         })
         .await;
@@ -1625,7 +1806,7 @@ mod tests {
             async move {
                 let path = format!("/repos/{}/actions/runs", r.full_name());
                 client.get::<serde_json::Value>(&path).await?;
-                Ok(vec![])
+                Ok(RepoStatus::default())
             }
         })
         .await;
@@ -1655,6 +1836,7 @@ mod tests {
             "conclusion": conclusion,
             "html_url": format!("https://github.com/o/r/actions/runs/{id}"),
             "created_at": "2026-06-29T11:50:00Z",
+            "run_started_at": "2026-06-29T11:50:00Z",
             "updated_at": "2026-06-29T11:52:30Z",
         })
     }
@@ -1680,7 +1862,35 @@ mod tests {
             "conclusion": conclusion,
             "html_url": format!("https://github.com/o/r/actions/runs/{id}"),
             "created_at": "2026-06-29T11:50:00Z",
+            "run_started_at": "2026-06-29T11:50:00Z",
             "updated_at": "2026-06-29T11:52:30Z",
+        })
+    }
+
+    fn active_run_json_with(
+        id: u64,
+        workflow_id: u64,
+        workflow: &str,
+        sha: &str,
+        branch: &str,
+        status: &str,
+        run_started_at: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "workflow_id": workflow_id,
+            "name": workflow,
+            "display_title": format!("Commit {sha}"),
+            "run_number": id,
+            "event": "push",
+            "head_branch": branch,
+            "head_sha": sha,
+            "status": status,
+            "conclusion": null,
+            "html_url": format!("https://github.com/o/r/actions/runs/{id}"),
+            "created_at": "2026-06-29T11:58:00Z",
+            "run_started_at": run_started_at,
+            "updated_at": "2026-06-29T11:59:00Z",
         })
     }
 
@@ -1767,6 +1977,23 @@ mod tests {
             .await;
     }
 
+    /// Mount an all-branch active runs-listing response for `owner/name`.
+    async fn mount_active_runs(
+        server: &MockServer,
+        owner: &str,
+        name: &str,
+        body: serde_json::Value,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{owner}/{name}/actions/runs")))
+            .and(query_param("per_page", "100"))
+            .and(query_param_is_missing("branch"))
+            .and(query_param_is_missing("status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
     /// Mount a jobs-listing response for a specific run id.
     async fn mount_jobs(
         server: &MockServer,
@@ -1814,6 +2041,60 @@ mod tests {
         // (11:50:00 → 11:52:30 = 150s).
         assert_eq!(run.duration_seconds, Some(150));
         assert!(run.jobs.is_empty());
+    }
+
+    #[test]
+    fn normalize_active_run_shortens_sha_and_maps_fields() {
+        let run = normalize_active_run(ApiRun {
+            id: 7,
+            workflow_id: Some(10),
+            name: Some("CI".into()),
+            display_title: Some("Fix it".into()),
+            run_number: 42,
+            event: Some("pull_request".into()),
+            head_branch: Some("feature/x".into()),
+            head_sha: Some("abcdef1234567890".into()),
+            status: Some("waiting".into()),
+            conclusion: None,
+            html_url: Some("https://example/run".into()),
+            created_at: Some("2026-06-29T11:50:00Z".into()),
+            run_started_at: Some("2026-06-29T11:51:00Z".into()),
+            updated_at: Some("2026-06-29T11:52:30Z".into()),
+        });
+
+        assert_eq!(run.workflow, "CI");
+        assert_eq!(run.branch, "feature/x");
+        assert_eq!(run.sha, "abcdef1", "head SHA is shortened to 7 chars");
+        assert_eq!(run.run_number, 42);
+        assert_eq!(run.status, RunStatus::Waiting);
+        assert_eq!(run.created_at, "2026-06-29T11:50:00Z");
+        assert_eq!(run.started_at.as_deref(), Some("2026-06-29T11:51:00Z"));
+    }
+
+    #[test]
+    fn normalize_active_run_degrades_absent_fields_to_defaults() {
+        let run = normalize_active_run(ApiRun {
+            id: 0,
+            workflow_id: None,
+            name: None,
+            display_title: None,
+            run_number: 0,
+            event: None,
+            head_branch: None,
+            head_sha: None,
+            status: None,
+            conclusion: None,
+            html_url: None,
+            created_at: None,
+            run_started_at: None,
+            updated_at: None,
+        });
+
+        assert_eq!(run.workflow, "");
+        assert_eq!(run.sha, "");
+        assert_eq!(run.status, RunStatus::InProgress);
+        assert_eq!(run.created_at, "");
+        assert_eq!(run.started_at, None);
     }
 
     #[test]
@@ -1992,6 +2273,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn select_active_commits_groups_non_completed_runs_newest_first() {
+        let runs = vec![
+            api_run(5, 1, "newest", "queued", None),
+            api_run(4, 1, "settled", "completed", Some("success")),
+            api_run(3, 1, "older", "in_progress", None),
+            api_run(2, 2, "newest", "waiting", None),
+        ];
+
+        let selected = select_active_commits(runs);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].full_sha, "newest");
+        assert_eq!(
+            selected[0]
+                .runs
+                .iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>(),
+            vec![5, 2],
+            "duplicate active workflow runs are preserved"
+        );
+        assert_eq!(selected[1].full_sha, "older");
+        assert_eq!(selected[1].runs.len(), 1);
+    }
+
     // --- Commit collection (mocked HTTP) --------------------------------
 
     #[tokio::test]
@@ -2141,8 +2448,14 @@ mod tests {
         .await;
 
         let client = test_client(&server.uri());
-        let reports =
-            collect_repo_reports(&client, vec![repo("o", "empty")], 1, 8).await;
+        let reports = collect_repo_reports(
+            &client,
+            vec![repo("o", "empty")],
+            1,
+            8,
+            false,
+        )
+        .await;
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].repo, "o/empty");
         assert!(
@@ -2206,6 +2519,190 @@ mod tests {
         let commits = client.collect_commits(&repo("o", "r"), 3).await.unwrap();
         assert_eq!(commits.len(), 1);
         // The `.expect(1)` on the mock asserts the query was exactly right.
+    }
+
+    #[tokio::test]
+    async fn active_fetch_sends_per_page_with_no_branch_or_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/actions/runs"))
+            .and(query_param("per_page", "100"))
+            .and(query_param_is_missing("branch"))
+            .and(query_param_is_missing("status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runs_body(
+                vec![active_run_json_with(
+                    44,
+                    1,
+                    "CI",
+                    "active-sha",
+                    "feature/x",
+                    "in_progress",
+                    Some("2026-06-29T11:58:40Z"),
+                )],
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let active = client
+            .collect_active_commits(&repo("o", "r"))
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].runs[0].status, RunStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn repo_collection_reports_active_and_settled_commits() {
+        let server = MockServer::start().await;
+        mount_repo_detail(&server, "o", "r", "main").await;
+        mount_active_runs(
+            &server,
+            "o",
+            "r",
+            runs_body(vec![
+                active_run_json_with(
+                    44,
+                    1,
+                    "CI",
+                    "active-sha",
+                    "feature/x",
+                    "in_progress",
+                    Some("2026-06-29T11:58:40Z"),
+                ),
+                run_json_with(
+                    43,
+                    1,
+                    "CI",
+                    "settled-sha",
+                    "completed",
+                    Some("success"),
+                ),
+            ]),
+        )
+        .await;
+        mount_runs(&server, "o", "r", runs_body(vec![run_json(1, "success")]))
+            .await;
+
+        let client = test_client(&server.uri());
+        let reports =
+            collect_repo_reports(&client, vec![repo("o", "r")], 1, 8, true)
+                .await;
+
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].error.is_none());
+        assert_eq!(reports[0].active.len(), 1);
+        assert_eq!(reports[0].commits.len(), 1);
+        assert_eq!(reports[0].active[0].branch, "feature/x");
+        assert_eq!(reports[0].active[0].runs[0].workflow, "CI");
+        assert_eq!(reports[0].active[0].runs[0].status, RunStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn active_only_repo_returns_active_with_no_settled_commits() {
+        let server = MockServer::start().await;
+        mount_repo_detail(&server, "o", "active-only", "main").await;
+        mount_active_runs(
+            &server,
+            "o",
+            "active-only",
+            runs_body(vec![active_run_json_with(
+                44,
+                1,
+                "CI",
+                "active-sha",
+                "feature/x",
+                "queued",
+                None,
+            )]),
+        )
+        .await;
+        mount_runs(
+            &server,
+            "o",
+            "active-only",
+            runs_body(vec![run_json_with(
+                44,
+                1,
+                "CI",
+                "active-sha",
+                "queued",
+                None,
+            )]),
+        )
+        .await;
+
+        let client = test_client(&server.uri());
+        let reports = collect_repo_reports(
+            &client,
+            vec![repo("o", "active-only")],
+            1,
+            8,
+            true,
+        )
+        .await;
+
+        assert_eq!(reports[0].active.len(), 1);
+        assert!(reports[0].commits.is_empty());
+        assert!(reports[0].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_active_collection_issues_no_unfiltered_runs_request() {
+        let server = MockServer::start().await;
+        mount_repo_detail(&server, "o", "r", "main").await;
+        mount_runs(&server, "o", "r", runs_body(vec![run_json(1, "success")]))
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/actions/runs"))
+            .and(query_param("per_page", "100"))
+            .and(query_param_is_missing("branch"))
+            .and(query_param_is_missing("status"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(runs_body(vec![])),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let reports =
+            collect_repo_reports(&client, vec![repo("o", "r")], 1, 8, false)
+                .await;
+
+        assert!(reports[0].active.is_empty());
+        assert_eq!(reports[0].commits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn active_fetch_failure_becomes_repo_error_row() {
+        let server = MockServer::start().await;
+        mount_repo_detail(&server, "o", "r", "main").await;
+        mount_runs(&server, "o", "r", runs_body(vec![run_json(1, "success")]))
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/actions/runs"))
+            .and(query_param("per_page", "100"))
+            .and(query_param_is_missing("branch"))
+            .and(query_param_is_missing("status"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(
+                    serde_json::json!({ "message": "Not Found" }),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let reports =
+            collect_repo_reports(&client, vec![repo("o", "r")], 1, 8, true)
+                .await;
+
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].active.is_empty());
+        assert!(reports[0].commits.is_empty());
+        assert!(reports[0].error.as_deref().unwrap().contains("404"));
     }
 
     #[tokio::test]
@@ -2280,6 +2777,7 @@ mod tests {
             vec![repo("o", "fail"), repo("o", "pass")],
             1,
             8,
+            false,
         )
         .await;
 

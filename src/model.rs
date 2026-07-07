@@ -1,6 +1,7 @@
 //! The single normalized result model that every output format renders from.
 //!
-//! `Report -> [RepoReport] -> [CommitReport] -> [RunReport] -> [JobReport] -> [StepReport]`.
+//! `Report -> [RepoReport] -> [ActiveCommitReport] -> [ActiveRunReport]`
+//! and `Report -> [RepoReport] -> [CommitReport] -> [RunReport] -> [JobReport] -> [StepReport]`.
 //! GitHub parsing (Phases 3–4) populates this tree; renderers (Phase 5) only
 //! ever read it. Phase 1 ships a deterministic [`Report::stub`] so all three
 //! output formats can be exercised end-to-end without any network access.
@@ -26,6 +27,9 @@ pub struct Report {
 pub struct RepoReport {
     /// `owner/name`.
     pub repo: String,
+    /// In-flight commits with queued/running/waiting workflow runs, newest
+    /// first. Active commits are rendered before settled commits.
+    pub active: Vec<ActiveCommitReport>,
     /// The most-recent settled commits, newest first. Empty repos are
     /// suppressed before rendering unless they carry an error.
     pub commits: Vec<CommitReport>,
@@ -33,6 +37,53 @@ pub struct RepoReport {
     /// Present errors never abort the whole run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// An in-flight commit on any branch, with all non-completed workflow runs for
+/// that commit grouped below it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveCommitReport {
+    /// Short (7-char) commit SHA.
+    pub sha: String,
+    /// Commit title / representative run display title.
+    pub title: String,
+    /// Branch this in-flight commit is running against.
+    pub branch: String,
+    /// Representative triggering event (`push`, `pull_request`, …).
+    pub event: String,
+    /// Direct URL to the commit on github.com.
+    pub url: String,
+    /// Earliest known start-ish timestamp across active runs. This uses
+    /// `run_started_at` when GitHub has one and falls back to `created_at`, so
+    /// the renderer can compute elapsed time against `Report::generated_at`.
+    pub started_at: String,
+    /// All active workflow runs for this commit.
+    pub runs: Vec<ActiveRunReport>,
+}
+
+/// A single non-completed workflow run, normalized from the GitHub API.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveRunReport {
+    /// Workflow name (e.g. `CI`).
+    pub workflow: String,
+    /// The run's display title (commit message / PR title).
+    pub title: String,
+    /// Monotonic run number within the workflow.
+    pub run_number: u64,
+    /// Triggering event (`push`, `pull_request`, `schedule`, …).
+    pub event: String,
+    /// Head branch the run is executing against.
+    pub branch: String,
+    /// Short (7-char) head SHA.
+    pub sha: String,
+    /// Current GitHub status of the non-completed run.
+    pub status: RunStatus,
+    /// Direct URL to the run on github.com.
+    pub url: String,
+    /// When the run was created (RFC3339).
+    pub created_at: String,
+    /// When execution actually started, if GitHub has reported it.
+    pub started_at: Option<String>,
 }
 
 /// A settled commit on a repository's default branch, with all workflow runs
@@ -145,6 +196,62 @@ pub enum Conclusion {
     Stale,
 }
 
+/// Normalized workflow-run status for non-completed runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    /// The run is queued.
+    Queued,
+    /// The run is executing.
+    InProgress,
+    /// The run is waiting on an external gate such as deployment protection.
+    Waiting,
+    /// The run is pending.
+    Pending,
+    /// The run was requested but has not started yet.
+    Requested,
+}
+
+impl RunStatus {
+    /// A short, stable, lower-case label matching GitHub's status strings.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunStatus::Queued => "queued",
+            RunStatus::InProgress => "in_progress",
+            RunStatus::Waiting => "waiting",
+            RunStatus::Pending => "pending",
+            RunStatus::Requested => "requested",
+        }
+    }
+
+    /// A single-character status glyph for human output.
+    pub fn icon(&self) -> &'static str {
+        match self {
+            RunStatus::InProgress => "↻",
+            RunStatus::Waiting => "⧗",
+            RunStatus::Queued | RunStatus::Pending | RunStatus::Requested => {
+                "⧖"
+            }
+        }
+    }
+
+    /// Parse a GitHub `status` string into a [`RunStatus`].
+    ///
+    /// Unknown or absent statuses map to [`RunStatus::InProgress`]: anything
+    /// non-completed is in flight, and "running" is the least misleading
+    /// fallback when GitHub adds a new transient status.
+    pub fn from_github(value: Option<&str>) -> RunStatus {
+        match value {
+            Some("queued") => RunStatus::Queued,
+            Some("in_progress") => RunStatus::InProgress,
+            Some("waiting") => RunStatus::Waiting,
+            Some("pending") => RunStatus::Pending,
+            Some("requested") => RunStatus::Requested,
+            _ => RunStatus::InProgress,
+        }
+    }
+}
+
 impl Conclusion {
     /// Whether this conclusion is literally GitHub `success`.
     pub fn is_success(&self) -> bool {
@@ -234,6 +341,21 @@ impl CommitReport {
     }
 }
 
+impl ActiveCommitReport {
+    /// Human rollup label for the active commit line.
+    pub fn rollup_label(&self) -> &'static str {
+        if self
+            .runs
+            .iter()
+            .any(|run| run.status == RunStatus::InProgress)
+        {
+            "running"
+        } else {
+            "queued"
+        }
+    }
+}
+
 impl RepoReport {
     /// Whether this repository has any red commit.
     pub fn has_failures(&self) -> bool {
@@ -261,6 +383,45 @@ impl Report {
             repos: vec![
                 RepoReport {
                     repo: "bbugyi200/actstat".to_string(),
+                    active: vec![ActiveCommitReport {
+                        sha: "f00ba12".to_string(),
+                        title: "Add progress spinner".to_string(),
+                        branch: "master".to_string(),
+                        event: "push".to_string(),
+                        url: "https://github.com/bbugyi200/actstat/commit/f00ba1234567890"
+                            .to_string(),
+                        started_at: "2026-06-29T11:58:40Z".to_string(),
+                        runs: vec![
+                            ActiveRunReport {
+                                workflow: "CI".to_string(),
+                                title: "Add progress spinner".to_string(),
+                                run_number: 44,
+                                event: "push".to_string(),
+                                branch: "master".to_string(),
+                                sha: "f00ba12".to_string(),
+                                status: RunStatus::InProgress,
+                                url: "https://github.com/bbugyi200/actstat/actions/runs/1044"
+                                    .to_string(),
+                                created_at: "2026-06-29T11:58:35Z".to_string(),
+                                started_at: Some(
+                                    "2026-06-29T11:58:40Z".to_string(),
+                                ),
+                            },
+                            ActiveRunReport {
+                                workflow: "Deploy Docs".to_string(),
+                                title: "Add progress spinner".to_string(),
+                                run_number: 13,
+                                event: "push".to_string(),
+                                branch: "master".to_string(),
+                                sha: "f00ba12".to_string(),
+                                status: RunStatus::Queued,
+                                url: "https://github.com/bbugyi200/actstat/actions/runs/1045"
+                                    .to_string(),
+                                created_at: "2026-06-29T11:58:50Z".to_string(),
+                                started_at: None,
+                            },
+                        ],
+                    }],
                     commits: vec![CommitReport {
                         sha: "a1b2c3d".to_string(),
                         title: "Add list subcommand".to_string(),
@@ -292,6 +453,7 @@ impl Report {
                 },
                 RepoReport {
                     repo: "bbugyi200/dotfiles".to_string(),
+                    active: vec![],
                     commits: vec![CommitReport {
                         sha: "9f8e7d6".to_string(),
                         title: "Refactor shell init".to_string(),
@@ -350,6 +512,7 @@ impl Report {
                 },
                 RepoReport {
                     repo: "bobs-org/locked".to_string(),
+                    active: vec![],
                     commits: vec![],
                     error: Some("403 Forbidden (token lacks access)".to_string()),
                 },
@@ -393,6 +556,64 @@ mod tests {
         );
         assert_eq!(Conclusion::from_github(None), Conclusion::Failure);
         assert!(!Conclusion::from_github(None).is_success());
+    }
+
+    #[test]
+    fn run_status_from_github_round_trips_every_known_status() {
+        for status in [
+            RunStatus::Queued,
+            RunStatus::InProgress,
+            RunStatus::Waiting,
+            RunStatus::Pending,
+            RunStatus::Requested,
+        ] {
+            assert_eq!(
+                RunStatus::from_github(Some(status.label())),
+                status,
+                "label() and from_github() must be inverses for {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_status_unknown_and_missing_fall_back_to_in_progress() {
+        assert_eq!(
+            RunStatus::from_github(Some("brand_new_status")),
+            RunStatus::InProgress
+        );
+        assert_eq!(RunStatus::from_github(None), RunStatus::InProgress);
+    }
+
+    #[test]
+    fn active_commit_rollup_prefers_running_over_queued() {
+        let mut commit = ActiveCommitReport {
+            sha: "abc1234".to_string(),
+            title: "Do work".to_string(),
+            branch: "main".to_string(),
+            event: "push".to_string(),
+            url: String::new(),
+            started_at: "2026-06-29T11:58:00Z".to_string(),
+            runs: vec![ActiveRunReport {
+                workflow: "CI".to_string(),
+                title: "Do work".to_string(),
+                run_number: 1,
+                event: "push".to_string(),
+                branch: "main".to_string(),
+                sha: "abc1234".to_string(),
+                status: RunStatus::Queued,
+                url: String::new(),
+                created_at: "2026-06-29T11:58:00Z".to_string(),
+                started_at: None,
+            }],
+        };
+
+        assert_eq!(commit.rollup_label(), "queued");
+        commit.runs.push(ActiveRunReport {
+            status: RunStatus::InProgress,
+            run_number: 2,
+            ..commit.runs[0].clone()
+        });
+        assert_eq!(commit.rollup_label(), "running");
     }
 
     #[test]

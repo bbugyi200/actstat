@@ -13,7 +13,10 @@ use std::fmt::Write as _;
 
 use owo_colors::{OwoColorize, Style};
 
-use crate::model::{CommitReport, Conclusion, Report, RunReport};
+use crate::model::{
+    ActiveCommitReport, ActiveRunReport, CommitReport, Conclusion, Report,
+    RunReport, RunStatus,
+};
 
 /// Apply `style` to `text` only when `use_color` is set; otherwise return the
 /// text verbatim with no escape codes (keeps no-color output byte-clean).
@@ -36,6 +39,17 @@ fn conclusion_style(conclusion: Conclusion) -> Style {
         | Conclusion::Stale
         | Conclusion::ActionRequired => Style::new().yellow(),
         Conclusion::Skipped | Conclusion::Neutral => Style::new().dimmed(),
+    }
+}
+
+/// Pick a color for an active run status.
+fn status_style(status: RunStatus) -> Style {
+    match status {
+        RunStatus::InProgress => Style::new().cyan(),
+        RunStatus::Waiting => Style::new().yellow(),
+        RunStatus::Queued | RunStatus::Pending | RunStatus::Requested => {
+            Style::new().cyan().dimmed()
+        }
     }
 }
 
@@ -70,16 +84,26 @@ pub fn human(report: &Report, use_color: bool, only_failures: bool) -> String {
             continue;
         }
 
+        let visible_active: Vec<&ActiveCommitReport> =
+            repo.active.iter().filter(|_| !only_failures).collect();
         let visible_commits: Vec<&CommitReport> = repo
             .commits
             .iter()
             .filter(|c| !only_failures || !c.is_success())
             .collect();
-        if visible_commits.is_empty() {
+        if visible_active.is_empty() && visible_commits.is_empty() {
             continue;
         }
 
         let _ = writeln!(block, "{}", paint(use_color, bold, &repo.repo));
+        for commit in visible_active {
+            render_active_commit(
+                &mut block,
+                commit,
+                &report.generated_at,
+                use_color,
+            );
+        }
         for commit in visible_commits {
             render_commit(&mut block, commit, &report.generated_at, use_color);
         }
@@ -92,6 +116,92 @@ pub fn human(report: &Report, use_color: bool, only_failures: bool) -> String {
     // Each block already ends in a newline; joining with one more inserts a
     // single blank line between repositories without a trailing blank line.
     blocks.join("\n")
+}
+
+/// Render one active commit, always expanded to its in-flight runs.
+fn render_active_commit(
+    out: &mut String,
+    commit: &ActiveCommitReport,
+    generated_at: &str,
+    use_color: bool,
+) {
+    let style = status_style(RunStatus::InProgress);
+    let dim = Style::new().dimmed();
+
+    let mut meta: Vec<String> = Vec::new();
+    if !commit.branch.is_empty() {
+        meta.push(commit.branch.clone());
+    }
+    if commit.runs.len() > 1 {
+        meta.push(format!("{} workflows", commit.runs.len()));
+    }
+    if let Some(elapsed) = elapsed_duration(&commit.started_at, generated_at) {
+        meta.push(elapsed);
+    }
+    let meta = meta.join(" · ");
+    let meta_prefix = if meta.is_empty() {
+        "·".to_string()
+    } else {
+        format!("· {meta} ·")
+    };
+
+    let title = if commit.title.is_empty() {
+        "(untitled commit)"
+    } else {
+        commit.title.as_str()
+    };
+    let summary = format!("{} {}", commit.sha, title);
+
+    let _ = writeln!(
+        out,
+        "  {} {} {} {}",
+        paint(use_color, style, RunStatus::InProgress.icon()),
+        summary,
+        paint(use_color, dim, &meta_prefix),
+        paint(use_color, style, commit.rollup_label()),
+    );
+
+    for run in &commit.runs {
+        render_active_run(out, run, generated_at, use_color);
+    }
+}
+
+/// Render one active run under an active commit.
+fn render_active_run(
+    out: &mut String,
+    run: &ActiveRunReport,
+    generated_at: &str,
+    use_color: bool,
+) {
+    let style = status_style(run.status);
+    let dim = Style::new().dimmed();
+
+    let mut meta = vec![format!("#{}", run.run_number)];
+    if let Some(started_at) = run.started_at.as_deref() {
+        if let Some(elapsed) = elapsed_duration(started_at, generated_at) {
+            meta.push(elapsed);
+        }
+    }
+    meta.push(run.status.label().to_string());
+    let meta = meta.join(" · ");
+
+    let workflow = if run.workflow.is_empty() {
+        "(unknown workflow)"
+    } else {
+        run.workflow.as_str()
+    };
+
+    let _ = writeln!(
+        out,
+        "      {} {} {}",
+        paint(use_color, style, run.status.icon()),
+        workflow,
+        paint(use_color, dim, &format!("· {meta}")),
+    );
+
+    if !run.url.is_empty() {
+        let _ = writeln!(out, "          {}", paint(use_color, dim, &run.url));
+    }
 }
 
 /// Render a single commit: a compact one-liner for green commits, plus an
@@ -229,6 +339,15 @@ fn relative_time(then: &str, now: &str) -> Option<String> {
     Some(humanize_ago(now_ts.as_second() - then_ts.as_second()))
 }
 
+/// Render elapsed time from `then` to `now` as a compact duration.
+fn elapsed_duration(then: &str, now: &str) -> Option<String> {
+    let then_ts: jiff::Timestamp = then.parse().ok()?;
+    let now_ts: jiff::Timestamp = now.parse().ok()?;
+    Some(humanize_duration(
+        (now_ts.as_second() - then_ts.as_second()).max(0) as u64,
+    ))
+}
+
 /// Format an elapsed number of seconds as a compact "x ago" string, picking the
 /// largest sensible unit. Non-positive inputs (clock skew / future) read as
 /// "just now".
@@ -298,6 +417,18 @@ pub fn jsonl(report: &Report) -> String {
             });
             let _ = writeln!(out, "{line}");
         }
+        for commit in &repo.active {
+            let mut value = serde_json::to_value(commit)
+                .expect("ActiveCommitReport always serializes");
+            if let serde_json::Value::Object(map) = &mut value {
+                map.insert(
+                    "type".to_string(),
+                    serde_json::json!("active_commit"),
+                );
+                map.insert("repo".to_string(), serde_json::json!(repo.repo));
+            }
+            let _ = writeln!(out, "{value}");
+        }
         for commit in &repo.commits {
             let mut value = serde_json::to_value(commit)
                 .expect("CommitReport always serializes");
@@ -352,18 +483,27 @@ mod tests {
         let report = Report::stub(1);
         let expected_commits: usize =
             report.repos.iter().map(|r| r.commits.len()).sum();
+        let expected_active: usize =
+            report.repos.iter().map(|r| r.active.len()).sum();
         let expected_errors =
             report.repos.iter().filter(|r| r.error.is_some()).count();
         let out = jsonl(&report);
 
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), expected_commits + expected_errors);
+        assert_eq!(
+            lines.len(),
+            expected_active + expected_commits + expected_errors
+        );
 
         for line in &lines {
             let value: serde_json::Value = serde_json::from_str(line)
                 .expect("each jsonl line is valid JSON");
             let kind = value["type"].as_str().expect("each record is tagged");
-            assert!(kind == "commit" || kind == "repo_error");
+            assert!(
+                kind == "commit"
+                    || kind == "active_commit"
+                    || kind == "repo_error"
+            );
             assert!(
                 value.get("repo").is_some(),
                 "each record carries its repo"
@@ -391,11 +531,13 @@ mod tests {
             repos: vec![
                 RepoReport {
                     repo: "o/empty".to_string(),
+                    active: vec![],
                     commits: vec![],
                     error: None,
                 },
                 RepoReport {
                     repo: "o/locked".to_string(),
+                    active: vec![],
                     commits: vec![],
                     error: Some("403 Forbidden".to_string()),
                 },
@@ -477,6 +619,11 @@ mod tests {
         let report = Report::stub(1);
         let expected = "\
 bbugyi200/actstat
+  ↻ f00ba12 Add progress spinner · master · 2 workflows · 1m20s · running
+      ↻ CI · #44 · 1m20s · in_progress
+          https://github.com/bbugyi200/actstat/actions/runs/1044
+      ⧖ Deploy Docs · #13 · queued
+          https://github.com/bbugyi200/actstat/actions/runs/1045
   ✔ a1b2c3d Add list subcommand · master · 2m30s · 7m ago
 
 bbugyi200/dotfiles
@@ -533,6 +680,43 @@ bbugyi200/dotfiles
                 .as_deref(),
             Some("1h ago")
         );
+    }
+
+    #[test]
+    fn elapsed_duration_is_none_for_unparseable_input() {
+        assert_eq!(elapsed_duration("", "2026-06-29T12:00:00Z"), None);
+        assert_eq!(
+            elapsed_duration("2026-06-29T11:58:40Z", "2026-06-29T12:00:00Z")
+                .as_deref(),
+            Some("1m20s")
+        );
+    }
+
+    #[test]
+    fn json_always_carries_active_array() {
+        let report = Report::stub(1);
+        let value: serde_json::Value =
+            serde_json::from_str(&json(&report)).unwrap();
+        for repo in value["repositories"].as_array().unwrap() {
+            assert!(repo["active"].is_array());
+        }
+    }
+
+    #[test]
+    fn jsonl_emits_active_commit_before_settled_commits() {
+        let report = Report::stub(1);
+        let out = jsonl(&report);
+        let records: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let actstat_records: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|record| record["repo"] == "bbugyi200/actstat")
+            .collect();
+        assert_eq!(actstat_records[0]["type"], "active_commit");
+        assert_eq!(actstat_records[1]["type"], "commit");
     }
 
     #[test]

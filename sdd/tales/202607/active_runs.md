@@ -1,6 +1,6 @@
 ---
 create_time: 2026-07-07 11:41:33
-status: wip
+status: done
 prompt: sdd/prompts/202607/active_runs.md
 ---
 # Plan: Show currently-running (in-flight) GitHub Actions runs per project

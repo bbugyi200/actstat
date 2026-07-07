@@ -74,6 +74,10 @@ pub struct ListArgs {
     #[arg(long)]
     pub only_failures: bool,
 
+    /// Skip fetching and showing in-flight workflow runs.
+    #[arg(long)]
+    pub no_active: bool,
+
     /// Restrict this run to a subset of configured repositories (repeatable).
     #[arg(long = "repo", value_name = "OWNER/NAME")]
     pub repos: Vec<String>,
@@ -225,10 +229,11 @@ async fn run_list(args: ListArgs) -> ExitCode {
     if args.verbose > 0 && !args.quiet {
         let _ = writeln!(
             std::io::stderr(),
-            "actstat: inspecting {} repositor{} (settled-commit limit={}, concurrency={})",
+            "actstat: inspecting {} repositor{} (settled-commit limit={}, active-runs={}, concurrency={})",
             repos.len(),
             if repos.len() == 1 { "y" } else { "ies" },
             args.limit,
+            if args.no_active { "skipped" } else { "included" },
             args.concurrency,
         );
     }
@@ -239,6 +244,7 @@ async fn run_list(args: ListArgs) -> ExitCode {
         repos,
         args.limit,
         args.concurrency,
+        !args.no_active,
     )
     .await;
     reports.extend(org_error_reports(resolved.org_errors));
@@ -297,6 +303,7 @@ fn org_error_reports(org_errors: Vec<(String, String)>) -> Vec<RepoReport> {
         .into_iter()
         .map(|(org, message)| RepoReport {
             repo: org,
+            active: vec![],
             commits: vec![],
             error: Some(format!("failed to expand org: {message}")),
         })
@@ -306,8 +313,11 @@ fn org_error_reports(org_errors: Vec<(String, String)>) -> Vec<RepoReport> {
 /// Drop repositories that produced no settled commits and no error. Error rows
 /// stay visible; empty successful repos are suppressed in every output format.
 fn suppress_empty_success_reports(reports: &mut Vec<RepoReport>) {
-    reports
-        .retain(|report| !report.commits.is_empty() || report.error.is_some());
+    reports.retain(|report| {
+        !report.active.is_empty()
+            || !report.commits.is_empty()
+            || report.error.is_some()
+    });
 }
 
 /// Restrict `repos` to the `--repo` selection, if any. With no selection the
@@ -374,6 +384,7 @@ mod tests {
         assert_eq!(args.limit, 1);
         assert_eq!(args.format, Format::Human);
         assert_eq!(args.color, ColorChoice::Auto);
+        assert!(!args.no_active);
     }
 
     #[test]
@@ -471,6 +482,7 @@ mod tests {
             "actstat",
             "list",
             "--only-failures",
+            "--no-active",
             "--fail-on-failure",
             "--concurrency",
             "4",
@@ -479,9 +491,26 @@ mod tests {
         .unwrap()
         .list_args();
         assert!(args.only_failures);
+        assert!(args.no_active);
         assert!(args.fail_on_failure);
         assert_eq!(args.concurrency, 4);
         assert_eq!(args.verbose, 2);
+    }
+
+    #[test]
+    fn no_active_parses_bare_and_under_list() {
+        assert!(
+            parse(&["actstat", "--no-active"])
+                .unwrap()
+                .list_args()
+                .no_active
+        );
+        assert!(
+            parse(&["actstat", "list", "--no-active"])
+                .unwrap()
+                .list_args()
+                .no_active
+        );
     }
 
     #[test]
@@ -536,6 +565,25 @@ mod tests {
             repos: vec![],
         };
         assert!(!all_repos_errored(&report), "no repos is not 'all errored'");
+        assert!(same_code(list_exit_code(&report, true), ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn active_only_report_does_not_trip_fail_on_failure() {
+        let active = Report::stub(1).repos[0].active.clone();
+        let report = Report {
+            generated_at: "2026-06-29T12:00:00Z".to_string(),
+            limit: 1,
+            repos: vec![RepoReport {
+                repo: "o/r".to_string(),
+                active,
+                commits: vec![],
+                error: None,
+            }],
+        };
+
+        assert!(!report.has_failures());
+        assert!(!all_repos_errored(&report));
         assert!(same_code(list_exit_code(&report, true), ExitCode::SUCCESS));
     }
 
@@ -597,6 +645,7 @@ mod tests {
         let mut rows = Report::stub(1).repos;
         rows.push(RepoReport {
             repo: "o/empty".to_string(),
+            active: vec![],
             commits: vec![],
             error: None,
         });
@@ -606,5 +655,21 @@ mod tests {
         assert!(rows.iter().any(|r| r.repo == "bbugyi200/actstat"));
         assert!(rows.iter().any(|r| r.repo == "bobs-org/locked"));
         assert!(!rows.iter().any(|r| r.repo == "o/empty"));
+    }
+
+    #[test]
+    fn suppress_empty_reports_keeps_active_only_repos() {
+        let active = Report::stub(1).repos[0].active.clone();
+        let mut rows = vec![RepoReport {
+            repo: "o/active".to_string(),
+            active,
+            commits: vec![],
+            error: None,
+        }];
+
+        suppress_empty_success_reports(&mut rows);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repo, "o/active");
     }
 }
