@@ -1,4 +1,10 @@
-# Agent Instructions
+# actstat - Agent Instructions
+
+IMPORTANT: You should not modify any of these memory files without approval from the user.
+
+## Tier 1 (short-term) Memory
+
+The following memories contains core (always loaded) context:
 
 ### 1. SASE = Structured Agentic Software Engineering (sase)
 
@@ -15,3 +21,8 @@ directory as you!
 #### Linked Repositories
 
 No linked repositories are configured for this context.
+
+## Tier 2 (long-term) Memory
+
+The below files contain detailed reference material. When working in their domain, you MUST use your `/sase_memory_read`
+skill to review their contents. Do not read canonical memory files directly.
