@@ -1,2 +1,2 @@
-sdd:
-  storage: separate_repo
+memory:
+  enabled: true
