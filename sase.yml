@@ -1,2 +1,1 @@
-memory:
-  enabled: true
+is_sase_managed: true
