@@ -1,1 +1,5 @@
 is_sase_managed: true
+repos:
+  sidecar:
+    - name: plans
+      auto_clone: true
