@@ -35,16 +35,16 @@ reference notes that agents read only when relevant.
 - Type: `short`
 - Description: No description set.
 - Parent: `AGENTS.md`
-- Lines: 33
-- Approx. tokens: 462
+- Lines: 35
+- Approx. tokens: 482
 
 ## Statistics
 
 - Total notes: 1
 - Short notes: 1
 - Long notes: 0
-- Total lines: 33
-- Total approx. tokens: 462
+- Total lines: 35
+- Total approx. tokens: 482
 
 ## Commands
 

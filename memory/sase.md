@@ -17,7 +17,9 @@ directory as you!
 
 ## Repositories
 
-No linked repositories are configured for this context.
+Configured linked and sidecar repositories for this context:
+
+- `actstat--research`: Durable SASE research reports and generated media.
 
 When you need to read or modify files in any repository other than your own workspace checkout, agents MUST use your
 `/sase_repo` skill first. This includes configured linked repos and sidecars, another SASE project's repo, and any
