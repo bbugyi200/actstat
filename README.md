@@ -59,7 +59,7 @@ links are not configurable for GitHub Enterprise Server.
 
 ## Quick start
 
-Authenticate with GitHub, create a minimal config, and run the command:
+Authenticate with GitHub and create the config directory:
 
 ```sh
 gh auth login
@@ -71,6 +71,9 @@ mkdir -p ~/.config/actstat
 projects:
   - repo: bbugyi200/actstat
 ```
+
+Save that YAML as `~/.config/actstat/config.yml` (replacing the example
+repository with one you want to inspect), then run:
 
 ```sh
 actstat
@@ -116,6 +119,11 @@ These keys are valid only on `org` entries. Organization names must be bare
 logins such as `example-org`; repository names must use `owner/name` form.
 Organization-owner matching in `exclude` is case-insensitive, as is exclusion
 matching against names returned by GitHub.
+
+Organization expansion follows GitHub's pagination through every returned page
+before applying these filters. This differs from workflow-run and job history,
+whose bounded lookup windows are described under
+[What gets reported](#what-gets-reported).
 
 `projects` must be present and contain at least one entry. Known fields are
 validated with actionable errors, but unknown YAML keys are ignored for forward
@@ -177,7 +185,9 @@ actstat list [OPTIONS]
 
 Running `actstat` with no subcommand behaves exactly like `actstat list`, and the
 `list` options work at the top level too (so `actstat -n 3` == `actstat list
--n 3`).
+-n 3`). When writing the subcommand explicitly, put all options after `list`:
+`actstat --config config.yml list` is rejected, while `actstat list --config
+config.yml` is valid.
 
 ### What gets reported
 
@@ -186,12 +196,15 @@ Running `actstat` with no subcommand behaves exactly like `actstat list`, and th
 - **Running:** for each repository, across all branches, the single most
   recently started workflow whose GitHub status is `in_progress`. Queued,
   waiting, pending, requested, and completed runs are not part of this section.
+  `actstat` compares execution start times, falls back to creation times, and
+  then uses the highest run ID when timestamps do not decide the result.
   `--no-active` skips this per-repository lookup.
 - **Settled:** for each repository, workflow runs from its default branch are
   grouped by commit SHA. If GitHub returns multiple runs for the same workflow
-  and commit, `actstat` keeps the run with the highest run ID. A commit is
-  eligible only when all retained runs are completed. Newer unsettled commits
-  are skipped, so older settled commits can still be shown.
+  and commit, `actstat` keeps the run with the highest run ID. Workflow identity
+  comes from GitHub's workflow ID, falling back to its name if the ID is absent.
+  A commit is eligible only when all retained runs are completed. Newer
+  unsettled commits are skipped, so older settled commits can still be shown.
 - **Health:** a settled commit is green when all its selected runs concluded
   `success`, `skipped`, or `neutral`. Conclusions such as `failure`,
   `cancelled`, `timed_out`, `action_required`, `startup_failure`, and `stale`
@@ -220,7 +233,7 @@ the running lookup is not part of that unit.
 | `--only-failures` | Show only errors and red settled commits in **human** output. | off |
 | `--no-active` | Skip fetching and showing the currently running workflow run. | off |
 | `--repo <OWNER/NAME>` | Filter the resolved repositories by exact `owner/name` (repeatable). | all |
-| `--concurrency <N>` | Max org expansions or repository collections in flight; values below `1` behave as `1`. | `8` |
+| `--concurrency <N>` | Max org expansions or repository collections in flight; `0` behaves as `1`. | `8` |
 | `--fail-on-failure` | Exit `2` if any inspected settled commit is red. | off |
 | `-v, --verbose` | Enable stderr diagnostics. The flag is repeatable, but extra repetitions currently add no detail. | off |
 | `-q, --quiet` | Suppress warnings and other non-error diagnostics on stderr; conflicts with `--verbose`. | off |
@@ -306,9 +319,12 @@ more specific conclusions such as `cancelled` or `timed_out`.
 ### JSON (`--format json`)
 
 A single pretty-printed document: top-level metadata plus a `repositories` array.
-Each repository always carries `active` and `commits` arrays, plus an `error`
-field only when collection failed. `active` contains zero or one commit; when
-present, that commit contains exactly one run with `status: "in_progress"`.
+Each result row always carries `active` and `commits` arrays, plus an `error`
+field only when collection failed. Repository rows use `owner/name` in `repo`.
+An organization-expansion failure uses the bare organization login in `repo`
+and begins its error message with `failed to expand org:`. `active` contains
+zero or one commit; when present, that commit contains exactly one run with
+`status: "in_progress"`.
 Settled commits contain their selected completed runs. Problem runs contain only
 problem jobs, and those jobs contain only problem steps; healthy jobs and steps
 are intentionally omitted. Optional duration fields are absent when GitHub did
@@ -450,14 +466,18 @@ from human and JSONL output.
 One JSON record per line for easy `jq`/shell piping. Every line carries a `type`
 (`active_commit`, `commit`, or `repo_error`) and its `repo`: at most one
 `active_commit` record per repository, one `commit` record per settled commit,
-and one `repo_error` record per errored repository. Active records precede
-settled records for the same repository.
+and one `repo_error` record per repository or organization error. For an
+organization-expansion error, `repo` is the bare organization login. Active
+records precede settled records for the same repository. An empty report writes
+no JSONL records (whereas JSON writes a document with an empty `repositories`
+array).
 
 ```jsonl
 {"branch":"master","event":"push","repo":"bbugyi200/actstat","runs":[{"branch":"master","created_at":"2026-06-29T11:58:35Z","event":"push","run_number":44,"sha":"f00ba12","started_at":"2026-06-29T11:58:40Z","status":"in_progress","title":"Add progress spinner","url":"https://github.com/bbugyi200/actstat/actions/runs/1044","workflow":"CI"}],"sha":"f00ba12","started_at":"2026-06-29T11:58:40Z","title":"Add progress spinner","type":"active_commit","url":"https://github.com/bbugyi200/actstat/commit/f00ba1234567890"}
 {"branch":"master","conclusion":"success","duration_seconds":150,"event":"push","finished_at":"2026-06-29T11:52:30Z","repo":"bbugyi200/actstat","runs":[{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:50:00Z","duration_seconds":150,"event":"push","jobs":[],"run_number":42,"sha":"a1b2c3d","title":"Add list subcommand","updated_at":"2026-06-29T11:52:30Z","url":"https://github.com/bbugyi200/actstat/actions/runs/1001","workflow":"CI"}],"sha":"a1b2c3d","title":"Add list subcommand","type":"commit","url":"https://github.com/bbugyi200/actstat/commit/a1b2c3d4e5f67890"}
 {"branch":"master","conclusion":"failure","duration_seconds":250,"event":"push","finished_at":"2026-06-29T11:44:10Z","repo":"bbugyi200/dotfiles","runs":[{"branch":"master","conclusion":"failure","created_at":"2026-06-29T11:40:00Z","duration_seconds":250,"event":"push","jobs":[{"conclusion":"failure","name":"test (3.14)","steps":[{"conclusion":"failure","name":"Run tests","number":5}],"url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002/job/3003"}],"run_number":128,"sha":"9f8e7d6","title":"Refactor shell init","updated_at":"2026-06-29T11:44:10Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2002","workflow":"CI"},{"branch":"master","conclusion":"success","created_at":"2026-06-29T11:41:00Z","duration_seconds":120,"event":"push","jobs":[],"run_number":33,"sha":"9f8e7d6","title":"Refactor shell init","updated_at":"2026-06-29T11:43:00Z","url":"https://github.com/bbugyi200/dotfiles/actions/runs/2003","workflow":"Deploy Docs"}],"sha":"9f8e7d6","title":"Refactor shell init","type":"commit","url":"https://github.com/bbugyi200/dotfiles/commit/9f8e7d6c5b4a3210"}
 {"error":"403 Forbidden (token lacks access)","repo":"bobs-org/locked","type":"repo_error"}
+{"error":"failed to expand org: not found (404): Not Found","repo":"missing-org","type":"repo_error"}
 ```
 
 ## Exit codes
@@ -516,6 +536,10 @@ that treats missing status as unhealthy should also reject `repo_error` records.
 - **Private repos missing, or orgs not fully expanded** — verify that the token
   can access the repository and has Actions and Metadata read permissions.
   Organization policy or SSO may also restrict a token.
+- **An organization shows `failed to expand org`** — the organization listing
+  failed, so none of the repositories available only through that `org` entry
+  could be inspected. Explicit `repo` entries and other successful organizations
+  still proceed.
 - **A repository shows an error row (`403`/`404`)** — the token can't see it, or
   it doesn't exist. This is isolated per repository and never stops collection
   for the rest of your projects. If the final output contains only error rows,
