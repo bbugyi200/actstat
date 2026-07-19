@@ -54,6 +54,33 @@ path (typically `~/.cargo/bin`). Make sure that directory is on your `PATH`.
 The exact minimum supported Rust version is recorded in
 [`Cargo.toml`](Cargo.toml).
 
+`actstat` currently targets GitHub.com: its REST API endpoint and generated web
+links are not configurable for GitHub Enterprise Server.
+
+## Quick start
+
+Authenticate with GitHub, create a minimal config, and run the command:
+
+```sh
+gh auth login
+mkdir -p ~/.config/actstat
+```
+
+```yaml
+# ~/.config/actstat/config.yml
+projects:
+  - repo: bbugyi200/actstat
+```
+
+```sh
+actstat
+```
+
+The GitHub CLI is convenient but optional. If you do not use it, set one of the
+token environment variables described under [Authentication](#authentication).
+For organization-wide monitoring, replace the `repo` entry with an `org` entry
+or combine both kinds as shown below.
+
 ## Configuration
 
 `actstat` reads a YAML config whose `projects` list contains organization and
@@ -87,6 +114,13 @@ An `org:` entry can refine how that organization's repositories are expanded:
 
 These keys are valid only on `org` entries. Organization names must be bare
 logins such as `example-org`; repository names must use `owner/name` form.
+Organization-owner matching in `exclude` is case-insensitive, as is exclusion
+matching against names returned by GitHub.
+
+`projects` must be present and contain at least one entry. Known fields are
+validated with actionable errors, but unknown YAML keys are ignored for forward
+compatibility. Because a misspelled optional key can therefore be ignored,
+double-check names such as `include_archived` and `include_forks`.
 
 ### Where the config is found
 
@@ -125,7 +159,9 @@ read the resulting token. Token discovery follows this order:
 
 Empty environment variables are ignored. Unauthenticated requests work for
 public resources but have low rate limits and cannot discover private
-repositories. For a fine-grained token, grant read access to the desired
+repositories. The first non-empty token wins: discovery does not validate a
+token or fall through to the next source if GitHub later rejects it. For a
+fine-grained token, grant read access to the desired
 repositories with [**Actions: read**](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-repository)
 and [**Metadata: read**](https://docs.github.com/en/rest/repos/repos#list-organization-repositories)
 permissions. A classic personal access token needs the `repo` scope for private
@@ -167,6 +203,12 @@ applied after settled commits are selected and does not affect the running
 section. For each problem run, job enrichment likewise uses one API page of up
 to 100 jobs; every step returned inside those jobs is considered.
 
+Running and settled collection form one per-repository result. A failure while
+fetching repository metadata, either workflow-run list, or a problem run's jobs
+produces one error row for that repository with no partial active or settled
+data. Collection still continues for every other repository. With `--no-active`,
+the running lookup is not part of that unit.
+
 ### `list` options
 
 | Option | Description | Default |
@@ -174,17 +216,18 @@ to 100 jobs; every step returned inside those jobs is considered.
 | `-n, --limit <N>` | Most-recent settled commits to inspect **per repository** (must be ≥ 1). | `1` |
 | `-f, --format <human\|json\|jsonl>` | Output format. | `human` |
 | `-c, --config <PATH>` | Explicit config path (overrides discovery). | discovery |
-| `--color <auto\|always\|never>` | Color control; `auto` honors `NO_COLOR`. | `auto` |
+| `--color <auto\|always\|never>` | Human-output color control; `auto` honors `NO_COLOR`. | `auto` |
 | `--only-failures` | Show only errors and red settled commits in **human** output. | off |
 | `--no-active` | Skip fetching and showing the currently running workflow run. | off |
 | `--repo <OWNER/NAME>` | Filter the resolved repositories by exact `owner/name` (repeatable). | all |
 | `--concurrency <N>` | Max org expansions or repository collections in flight; values below `1` behave as `1`. | `8` |
 | `--fail-on-failure` | Exit `2` if any inspected settled commit is red. | off |
-| `-v, --verbose` | Increase diagnostic verbosity (stderr only; repeatable). | off |
-| `-q, --quiet` | Suppress non-error diagnostics (stderr only). | off |
+| `-v, --verbose` | Enable stderr diagnostics. The flag is repeatable, but extra repetitions currently add no detail. | off |
+| `-q, --quiet` | Suppress warnings and other non-error diagnostics on stderr; conflicts with `--verbose`. | off |
 
 `--only-failures` filters the human view only; it also hides the running section
 because a running workflow is not yet a failure. JSON and JSONL are unaffected.
+Likewise, `--color` never adds ANSI escapes to JSON or JSONL.
 `--repo` is a filter, not a way to add a repository. Resolution happens first:
 `actstat` expands every configured organization, merges those results with
 explicit `repo` entries, and only then applies `--repo`. The flag therefore does
@@ -218,7 +261,9 @@ plus branch, aggregate duration, and relative completion time when available. A
 red commit keeps that summary and expands each problem run with its returned
 problem jobs and steps, plus relevant GitHub URLs. Repositories with neither a
 running workflow nor a settled commit are omitted; repository and organization
-errors remain visible as red rows.
+errors remain visible as red rows. If no blocks remain, human output is
+`no commits to report` (this also happens when `--only-failures` hides every
+healthy result).
 
 ```text
 bbugyi200/actstat
@@ -267,7 +312,9 @@ present, that commit contains exactly one run with `status: "in_progress"`.
 Settled commits contain their selected completed runs. Problem runs contain only
 problem jobs, and those jobs contain only problem steps; healthy jobs and steps
 are intentionally omitted. Optional duration fields are absent when GitHub did
-not provide enough valid timestamps to calculate them.
+not provide enough valid timestamps to calculate them. Successful repositories
+with no active or settled data are absent from `repositories`, just as they are
+from human and JSONL output.
 
 ```json
 {

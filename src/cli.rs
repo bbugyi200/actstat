@@ -66,7 +66,8 @@ pub struct ListArgs {
     #[arg(short, long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Color control. `auto` honors `NO_COLOR`; explicit modes override it.
+    /// Human-output color control. `auto` honors `NO_COLOR`; explicit modes
+    /// override it.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, value_name = "WHEN")]
     pub color: ColorChoice,
 
@@ -90,11 +91,12 @@ pub struct ListArgs {
     #[arg(long)]
     pub fail_on_failure: bool,
 
-    /// Increase diagnostic verbosity (stderr only). Repeatable.
+    /// Enable diagnostic output on stderr. Repeatable; extra occurrences
+    /// currently add no further detail.
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Suppress non-error diagnostics (stderr only).
+    /// Suppress warnings and non-error diagnostics; conflicts with `--verbose`.
     #[arg(short, long, conflicts_with = "verbose")]
     pub quiet: bool,
 }
