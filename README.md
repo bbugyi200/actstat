@@ -59,30 +59,38 @@ links are not configurable for GitHub Enterprise Server.
 
 ## Quick start
 
-Authenticate with GitHub and create the config directory:
+1. Authenticate with GitHub. This is optional for public repositories, but it
+   provides a higher rate limit and is required for private repositories:
 
-```sh
-gh auth login
-mkdir -p ~/.config/actstat
-```
+   ```sh
+   gh auth login
+   ```
 
-```yaml
-# ~/.config/actstat/config.yml
-projects:
-  - repo: bbugyi200/actstat
-```
+2. Create the config directory, then save the YAML below as
+   `~/.config/actstat/config.yml`. Replace the example repository with one you
+   want to inspect:
 
-Save that YAML as `~/.config/actstat/config.yml` (replacing the example
-repository with one you want to inspect), then run:
+   ```sh
+   mkdir -p ~/.config/actstat
+   ```
 
-```sh
-actstat
-```
+   ```yaml
+   # ~/.config/actstat/config.yml
+   projects:
+     - repo: bbugyi200/actstat
+   ```
 
-The GitHub CLI is convenient but optional. If you do not use it, set one of the
-token environment variables described under [Authentication](#authentication).
-For organization-wide monitoring, replace the `repo` entry with an `org` entry
-or combine both kinds as shown below.
+3. Run `actstat`:
+
+   ```sh
+   actstat
+   ```
+
+The GitHub CLI is only one authentication option. Without it, set one of the
+token environment variables described under [Authentication](#authentication),
+or accept the warning and limited access of unauthenticated requests. For
+organization-wide monitoring, replace the `repo` entry with an `org` entry or
+combine both kinds as shown below.
 
 ## Configuration
 
@@ -117,8 +125,9 @@ An `org:` entry can refine how that organization's repositories are expanded:
 
 These keys are valid only on `org` entries. Organization names must be bare
 logins such as `example-org`; repository names must use `owner/name` form.
-Organization-owner matching in `exclude` is case-insensitive, as is exclusion
-matching against names returned by GitHub.
+Both exclusion checks are case-insensitive: the owner in an `exclude` entry may
+differ in case from the configured `org`, and its complete `owner/name` is
+compared case-insensitively with repository names returned by GitHub.
 
 Organization expansion follows GitHub's pagination through every returned page
 before applying these filters. This differs from workflow-run and job history,
@@ -185,13 +194,18 @@ actstat list [OPTIONS]
 
 Running `actstat` with no subcommand behaves exactly like `actstat list`, and the
 `list` options work at the top level too (so `actstat -n 3` == `actstat list
--n 3`). When writing the subcommand explicitly, put all options after `list`:
-`actstat --config config.yml list` is rejected, while `actstat list --config
-config.yml` is valid.
+-n 3`). These are two alternative forms: when writing the `list` subcommand
+explicitly, put its options after `list`. For example, `actstat --config
+config.yml list` is rejected, while `actstat list --config config.yml` is
+valid.
 
 ### What gets reported
 
 `actstat` deliberately treats live work and settled history differently:
+
+Here, **settled** is a reporting term: every workflow run retained for that
+commit has completed. It does not mean that every workflow defined in the
+repository produced a run for the commit.
 
 - **Running:** for each repository, across all branches, the single most
   recently started workflow whose GitHub status is `in_progress`. Queued,
@@ -321,10 +335,11 @@ more specific conclusions such as `cancelled` or `timed_out`.
 A single pretty-printed document: top-level metadata plus a `repositories` array.
 Each result row always carries `active` and `commits` arrays, plus an `error`
 field only when collection failed. Repository rows use `owner/name` in `repo`.
-An organization-expansion failure uses the bare organization login in `repo`
-and begins its error message with `failed to expand org:`. `active` contains
-zero or one commit; when present, that commit contains exactly one run with
-`status: "in_progress"`.
+The array can also contain organization-expansion error rows. They use the same
+shape even though they are not repositories: `repo` contains the bare
+organization login, and `error` begins with `failed to expand org:`. `active`
+contains zero or one commit; when present, that commit contains exactly one run
+with `status: "in_progress"`.
 Settled commits contain their selected completed runs. Problem runs contain only
 problem jobs, and those jobs contain only problem steps; healthy jobs and steps
 are intentionally omitted. Optional duration fields are absent when GitHub did
