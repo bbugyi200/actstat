@@ -19,7 +19,7 @@ use crate::github::{self, DiscoveredToken};
 use crate::model::{RepoReport, Report};
 use crate::render;
 
-/// Report the status of recent settled GitHub Actions commits across repos.
+/// Report running and recent settled GitHub Actions status across repositories.
 #[derive(Debug, Parser)]
 #[command(
     name = "actstat",
@@ -41,7 +41,7 @@ pub struct Cli {
 /// The set of subcommands. Today there is exactly one.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// List recent settled commit status per repository (the default command).
+    /// List running and recent settled status per repository (the default).
     List(ListArgs),
 }
 
@@ -66,27 +66,27 @@ pub struct ListArgs {
     #[arg(short, long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Color control. Also honors the `NO_COLOR` environment variable.
+    /// Color control. `auto` honors `NO_COLOR`; explicit modes override it.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, value_name = "WHEN")]
     pub color: ColorChoice,
 
-    /// Show only failing commits in human output.
+    /// Show only errors and failing settled commits in human output.
     #[arg(long)]
     pub only_failures: bool,
 
-    /// Skip fetching and showing the currently running workflow run.
+    /// Skip each repository's running-workflow lookup.
     #[arg(long)]
     pub no_active: bool,
 
-    /// Restrict this run to a subset of configured repositories (repeatable).
+    /// Filter resolved repositories by exact owner/name (repeatable).
     #[arg(long = "repo", value_name = "OWNER/NAME")]
     pub repos: Vec<String>,
 
-    /// Max concurrent repositories in flight.
+    /// Max org expansions or repository collections in flight; 0 acts as 1.
     #[arg(long, value_name = "N", default_value_t = 8)]
     pub concurrency: usize,
 
-    /// Exit non-zero if any inspected commit is failing (for cron/CI).
+    /// Exit 2 if any inspected settled commit is failing (for cron/CI).
     #[arg(long)]
     pub fail_on_failure: bool,
 

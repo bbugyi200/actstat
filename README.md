@@ -2,15 +2,15 @@
 
 [![CI](https://github.com/bbugyi200/actstat/actions/workflows/ci.yml/badge.svg)](https://github.com/bbugyi200/actstat/actions/workflows/ci.yml)
 
-A fast, readable Rust CLI that shows the newest running GitHub Actions workflow
-plus the health of recent settled commits across a configured set of
-repositories.
+A fast, readable Rust CLI that shows, for each configured repository, the newest
+running GitHub Actions workflow plus the health of recent settled commits.
 
 `actstat` answers three questions quickly: **what is running, which projects are
-healthy, and what needs attention?** The newest running workflow across all
-branches appears above settled default-branch history. A green commit collapses
-to one compact line; a red commit expands into the problem runs, jobs, and steps
-with direct links to GitHub.
+healthy, and what needs attention?** In each repository, the newest running
+workflow across all branches appears above settled default-branch history. A
+green commit collapses to one compact line; a red commit expands into the
+problem runs and their returned problem jobs and steps, with direct links to
+GitHub.
 
 It is built to be comfortable as an interactive terminal command **and**
 dependable inside cronjobs and scripts: async fan-out across repositories, a
@@ -21,13 +21,14 @@ broken repository never aborts the run), and structured machine-readable output
 ## Highlights
 
 - **Compact when healthy, detailed when not.** Green commits are one line; red
-  commits expand to problem runs → jobs → steps → GitHub URLs.
-- **Live running workflow.** The most recently started `in_progress` workflow
-  run is shown above settled commits with a direct link to the live run log.
+  commits expand to problem runs → returned jobs → steps → GitHub URLs.
+- **Live running workflow.** Each repository's most recently started
+  `in_progress` workflow run is shown above settled commits with a direct link
+  to the live run log.
 - **Resilient.** Repository and organization API failures become inline error
   rows instead of aborting collection for other projects.
-- **Scriptable.** `--format json` / `--format jsonl` emit deterministic records
-  on stdout; all diagnostics go to stderr.
+- **Scriptable.** `--format json` / `--format jsonl` emit structured records in
+  consistent repository order on stdout; all diagnostics go to stderr.
 - **Conservative & fast.** Bounded-concurrency async HTTP with retry/backoff on
   transient errors.
 - **No secrets in config.** Tokens come only from the environment or `gh`.
@@ -71,7 +72,8 @@ An `org` entry expands to every repository visible to the current token, except
 that archived repositories and forks are excluded by default. A `repo` entry
 selects exactly one `owner/name`, including an archived repository or fork.
 All sources are merged into a de-duplicated, alphabetically sorted list. A
-repository selected both explicitly and through its organization appears once.
+repository selected under the same exact `owner/name` both explicitly and
+through its organization appears once.
 
 ### Org filters
 
@@ -145,21 +147,25 @@ Running `actstat` with no subcommand behaves exactly like `actstat list`, and th
 
 `actstat` deliberately treats live work and settled history differently:
 
-- **Running:** across all branches, the single most recently started workflow
-  whose GitHub status is `in_progress`. Queued, waiting, pending, requested, and
-  completed runs are not part of this section. `--no-active` skips this lookup.
-- **Settled:** workflow runs from the repository's default branch are grouped by
-  commit SHA. Re-runs are reduced to the latest attempt of each workflow, and a
-  commit is eligible only when all of those attempts are completed. Newer
-  unsettled commits are skipped, so older settled commits can still be shown.
+- **Running:** for each repository, across all branches, the single most
+  recently started workflow whose GitHub status is `in_progress`. Queued,
+  waiting, pending, requested, and completed runs are not part of this section.
+  `--no-active` skips this per-repository lookup.
+- **Settled:** for each repository, workflow runs from its default branch are
+  grouped by commit SHA. If GitHub returns multiple runs for the same workflow
+  and commit, `actstat` keeps the run with the highest run ID. A commit is
+  eligible only when all retained runs are completed. Newer unsettled commits
+  are skipped, so older settled commits can still be shown.
 - **Health:** a settled commit is green when all its selected runs concluded
   `success`, `skipped`, or `neutral`. Conclusions such as `failure`,
   `cancelled`, `timed_out`, `action_required`, `startup_failure`, and `stale`
   make the commit red.
 
-Both workflow-run lookups use GitHub's newest 100 matching records rather than
-unbounded history. `--limit` is applied after settled commits are selected and
-does not affect the running section.
+Each workflow-run lookup requests only the first GitHub API page, with up to 100
+runs; `actstat` does not paginate into older workflow-run history. `--limit` is
+applied after settled commits are selected and does not affect the running
+section. For each problem run, job enrichment likewise uses one API page of up
+to 100 jobs; every step returned inside those jobs is considered.
 
 ### `list` options
 
@@ -171,17 +177,21 @@ does not affect the running section.
 | `--color <auto\|always\|never>` | Color control; `auto` honors `NO_COLOR`. | `auto` |
 | `--only-failures` | Show only errors and red settled commits in **human** output. | off |
 | `--no-active` | Skip fetching and showing the currently running workflow run. | off |
-| `--repo <OWNER/NAME>` | Restrict to a subset of configured repositories (repeatable). | all |
-| `--concurrency <N>` | Max repositories fetched concurrently. | `8` |
+| `--repo <OWNER/NAME>` | Filter the resolved repositories by exact `owner/name` (repeatable). | all |
+| `--concurrency <N>` | Max org expansions or repository collections in flight; values below `1` behave as `1`. | `8` |
 | `--fail-on-failure` | Exit `2` if any inspected settled commit is red. | off |
 | `-v, --verbose` | Increase diagnostic verbosity (stderr only; repeatable). | off |
 | `-q, --quiet` | Suppress non-error diagnostics (stderr only). | off |
 
 `--only-failures` filters the human view only; it also hides the running section
 because a running workflow is not yet a failure. JSON and JSONL are unaffected.
-`--repo` is a filter over repositories already resolved from the config, not a
-way to add a repository. A well-formed name that is not configured simply
-matches nothing.
+`--repo` is a filter, not a way to add a repository. Resolution happens first:
+`actstat` expands every configured organization, merges those results with
+explicit `repo` entries, and only then applies `--repo`. The flag therefore does
+not avoid organization API calls, and an error from any configured organization
+still appears in the output. Matching uses the exact resolved `owner/name`
+string, including case; a well-formed name that was not resolved matches
+nothing.
 
 ### Examples
 
@@ -190,7 +200,7 @@ actstat                              # status of the latest settled commit per r
 actstat -n 5                         # inspect the 5 most recent settled commits each
 actstat --only-failures              # show only what's broken
 actstat --no-active                  # skip running workflow lookup
-actstat --repo bbugyi200/actstat     # just one repo, ignoring the rest of the config
+actstat --repo bbugyi200/actstat     # select one resolved repo (orgs are still expanded)
 actstat -f jsonl | jq -r 'select(.type == "active_commit") | .runs[].url'
 actstat -f jsonl | jq -r 'select(.type == "commit" and .conclusion == "failure") | .repo'
 actstat --fail-on-failure -q         # quiet gate for cron/CI (see exit codes below)
@@ -200,12 +210,13 @@ actstat --fail-on-failure -q         # quiet gate for cron/CI (see exit codes be
 
 ### Human (default)
 
-Repositories are grouped and sorted alphabetically. The newest running workflow,
-if one exists, appears first with its branch, elapsed time, status, and live run
-URL. Settled default-branch commits follow newest first. A green commit is one
-compact line containing its short SHA, title, branch, aggregate duration, and
-relative completion time. A red commit keeps that summary and expands into each
-problem run, job, step, and relevant GitHub URL. Repositories with neither a
+Repositories are grouped and sorted alphabetically. For each repository, its
+newest running workflow, if one exists, appears first with its branch, elapsed
+time, status, and live run URL. Settled default-branch commits follow newest
+first. A green commit is one compact line containing its short SHA and title,
+plus branch, aggregate duration, and relative completion time when available. A
+red commit keeps that summary and expands each problem run with its returned
+problem jobs and steps, plus relevant GitHub URLs. Repositories with neither a
 running workflow nor a settled commit are omitted; repository and organization
 errors remain visible as red rows.
 
@@ -409,8 +420,8 @@ to **stderr**, so `actstat list -f json` is always pipe-clean.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Collection completed. Without `--fail-on-failure`, a red commit alone does not change the exit code. An isolated repository or organization error also does not change it when another repository produced a report. |
-| `1` | Operational error: no usable config, config parse error, every inspected repository errored, or a fatal client/runtime error. |
+| `0` | Normal completion: the final report is empty or contains a non-error repository row, and either `--fail-on-failure` is off or no settled commit is red. |
+| `1` | Operational error: no usable config, config parse error, a fatal client/runtime error, or a non-empty final report in which every row is a repository or organization error. |
 | `2` | `--fail-on-failure` is set and at least one inspected settled commit is red, or the command line contains a usage error. |
 
 By default `actstat` reports without gating (exit `0`); pass `--fail-on-failure`
@@ -420,13 +431,18 @@ workflow has not failed or passed yet, so it never triggers exit `2`.
 Per-repository and per-organization errors are represented in the output so one
 inaccessible project does not abort the rest of the report. If those partial
 errors must fail an automation, inspect `repo_error` JSONL records explicitly.
+Successful repositories with neither a running workflow nor a settled commit
+are omitted before the exit code is chosen. Consequently, an organization error
+plus only empty successful repositories exits `1`, because the final report
+contains error rows only.
 
 ## Cronjob recipe
 
 `actstat` is built for unattended use. Cron has a minimal environment, so use
 absolute paths for the binary, config, and output files. Make authentication
 available to the cron process through its environment or an authenticated `gh`
-installation; do not put a real token directly in a checked-in crontab.
+installation that cron can find on `PATH`; do not put a real token directly in
+a checked-in crontab.
 
 ```cron
 # Every 15 minutes: write machine output and return 2 if a settled commit is red.
@@ -434,9 +450,9 @@ installation; do not put a real token directly in a checked-in crontab.
 ```
 
 With `--fail-on-failure`, exit `2` means "something is red" and exit `1` means
-"actstat itself couldn't run" (bad config, no network, or every lookup failed).
-Partial errors can still exit `0`, so an automation that treats missing status as
-unhealthy should also reject `repo_error` records.
+"actstat itself couldn't run" (bad config, no network, or a final report that
+contains only error rows). Partial errors can still exit `0`, so an automation
+that treats missing status as unhealthy should also reject `repo_error` records.
 
 ## Troubleshooting
 
@@ -454,11 +470,13 @@ unhealthy should also reject `repo_error` records.
   can access the repository and has Actions and Metadata read permissions.
   Organization policy or SSO may also restrict a token.
 - **A repository shows an error row (`403`/`404`)** — the token can't see it, or
-  it doesn't exist. This is isolated per repository and never aborts the run; the
-  rest of your projects still report.
+  it doesn't exist. This is isolated per repository and never stops collection
+  for the rest of your projects. If the final output contains only error rows,
+  the command exits `1`.
 - **A repo is missing from output** — it had no currently running workflow run
   and no qualifying settled commits in the recent default-branch run window.
-  Empty repos are omitted rather than shown as neutral rows. An org expansion
+  Empty repos are omitted rather than shown as neutral rows, and
+  `--only-failures` hides healthy repositories in human output. An org expansion
   also omits archived repositories and forks unless their filters enable them.
 - **A completed feature-branch run is absent from settled history** — settled
   commits come only from each repository's default branch. The one running
@@ -469,11 +487,12 @@ unhealthy should also reject `repo_error` records.
   `--no-active` is used.
 - **The newest GitHub commit is absent** — if it has no `in_progress` workflow
   run and no settled default-branch run yet, it is omitted. The running-run
-  and default-branch lookups are each bounded to the newest 100 matching records
-  returned by GitHub.
+  and default-branch lookups each inspect only the first API page, with at most
+  100 returned runs.
 - **`--repo` produces no output** — the flag only filters repositories selected
-  by the config. Confirm the exact `owner/name` is present directly or through a
-  successful org expansion.
+  by the config. Confirm the exact, case-sensitive `owner/name` was resolved
+  directly or through a successful org expansion. All configured organizations
+  are still expanded before this filter is applied.
 - **Use `-v` to diagnose** — add `--verbose` to print the token source and how
   many repositories are being inspected (on stderr, so stdout stays clean).
 
