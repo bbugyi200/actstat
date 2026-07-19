@@ -160,8 +160,8 @@ pub fn use_color(choice: ColorChoice) -> bool {
 /// Parse the process arguments and run, returning the process exit code.
 ///
 /// Collection is I/O-bound fan-out over many repositories, so this drives an
-/// async [`run_list`] on a Tokio runtime. A runtime that fails to start is an
-/// operational error (exit `1`).
+/// async `run_list` operation on a Tokio runtime. A runtime that fails to start
+/// is an operational error (exit `1`).
 pub fn run() -> ExitCode {
     let args = Cli::parse().list_args();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
