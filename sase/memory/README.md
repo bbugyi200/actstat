@@ -54,16 +54,16 @@ reference notes that agents read only when relevant.
   lifecycle agents must never hand-edit, task-bead triage, phase-bead description prefixes, and non-cascading close,
   resolution, and note semantics.
 - Parent: `AGENTS.md`
-- Lines: 94
-- Approx. tokens: 1269
+- Lines: 98
+- Approx. tokens: 1333
 
 ## Statistics
 
 - Total notes: 2
 - Short notes: 1
 - Long notes: 1
-- Total lines: 144
-- Total approx. tokens: 2000
+- Total lines: 148
+- Total approx. tokens: 2064
 
 ## Commands
 
