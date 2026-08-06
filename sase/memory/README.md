@@ -45,8 +45,8 @@ reference notes that agents read only when relevant.
 - Type: `short`
 - Description: No description set.
 - Parent: `AGENTS.md`
-- Lines: 50
-- Approx. tokens: 731
+- Lines: 51
+- Approx. tokens: 766
 
 ### `sase/memory/sase_beads.md`
 
@@ -55,16 +55,16 @@ reference notes that agents read only when relevant.
   lifecycle agents must never hand-edit, task-bead triage, phase-bead description prefixes, and non-cascading close,
   resolution, and note semantics.
 - Parent: `AGENTS.md`
-- Lines: 98
-- Approx. tokens: 1333
+- Lines: 110
+- Approx. tokens: 1603
 
 ## Statistics
 
 - Total notes: 2
 - Short notes: 1
 - Long notes: 1
-- Total lines: 148
-- Total approx. tokens: 2064
+- Total lines: 161
+- Total approx. tokens: 2369
 
 ## Commands
 
