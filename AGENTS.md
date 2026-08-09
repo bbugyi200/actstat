@@ -13,7 +13,7 @@ The following memories contain core (always loaded) context:
 
 ### 1. SASE = Structured Agentic Software Engineering (sase)
 
-#### Ephemeral `actstat_<N>` Workspace Directories
+#### 1.1 Ephemeral `actstat_<N>` Workspace Directories
 
 SASE runs agents (like you) from ephemeral workspace directories, which are full clones
 of the actstat repo. These directories are named `actstat_<N>` where `<N>` is some
@@ -24,7 +24,7 @@ IMPORTANT: Do NOT mention your workspace directory (or any sibling workspace dir
 in any plan files that you generate using your `/sase_plan` skill. The agent(s) that
 implement the plan might not run in the same workspace directory as you!
 
-#### Repositories
+#### 1.2 Repositories
 
 Configured linked and sidecar repositories for this context:
 
@@ -47,7 +47,7 @@ discussions.
 IMPORTANT REMINDER: Do NOT locate, clone, or web-fetch another repo's contents any other
 way than by using `/sase_repo`!
 
-#### File Discovered Work As Task Beads
+#### 1.3 File Discovered Work As Task Beads
 
 Unless your prompt explicitly forbids creating beads (epic phase workers, for example,
 must record `PROPOSED FOLLOW-UP:` notes on their own bead instead), you can and SHOULD
