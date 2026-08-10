@@ -65,8 +65,8 @@ always-loaded notes from detailed reference notes that agents read only when rel
   phase-bead description prefixes, and non-cascading close, resolution, and note
   semantics.
 - Parent: `AGENTS.md`
-- Lines: 130
-- Approx. tokens: 1642
+- Lines: 134
+- Approx. tokens: 1732
 
 ### `sase/memory/sase_sizes.md`
 
@@ -74,16 +74,16 @@ always-loaded notes from detailed reference notes that agents read only when rel
 - Description: SASE size scale guidance for epic phases, task beads, and tale plans,
   including plan-first behavior, task defaults, and model routing.
 - Parent: `sase/memory/sase_beads.md`
-- Lines: 46
-- Approx. tokens: 555
+- Lines: 41
+- Approx. tokens: 477
 
 ## Statistics
 
 - Total notes: 3
 - Short notes: 1
 - Long notes: 2
-- Total lines: 237
-- Total approx. tokens: 2964
+- Total lines: 236
+- Total approx. tokens: 2976
 
 ## Commands
 
