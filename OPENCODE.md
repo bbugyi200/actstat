@@ -139,13 +139,11 @@ closes them with a reason.
 
 ## 2. Tier 2 (long-term) Memory
 
-### 2.1 Long-Term Memory Files
-
 The below files contain detailed reference material. When working in their domain, you
 MUST use your `/sase_memory_read` skill to review their contents. Do not read canonical
 memory files directly.
 
-#### 2.1.1 `sase/memory/sase_beads.md`
+### 2.1 `sase/memory/sase_beads.md`
 
 Read before creating, updating, closing, or querying sase beads — bead types and tiers,
 the status lifecycle agents must never hand-edit, task-bead triage, phase-bead
