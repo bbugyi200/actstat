@@ -105,7 +105,7 @@
       "when_to_use": "File one when you discovered a product or capability idea that is outside the current task or epic. State the proposal and why it is out of scope for the work you were doing. Do not file one for in-scope follow-up that belongs on the current epic.",
       "glyph": "✦",
       "accent_color": "#5FD75F",
-      "agent_creatable": true,
+      "agent_creatable": false,
       "fields": [
         {
           "name": "proposal",
@@ -132,9 +132,9 @@
       "triage": {
         "min_plus_ones": 0
       },
-      "source": "builtin",
-      "package": "sase",
-      "digest": "3169592d767ec44de72a46f2ba3dd1e1ab88e120a07275bfacf1991e187058b7"
+      "source": "project",
+      "package": "project",
+      "digest": "43dcbe4bc6a3cb8e4ca9ca164381c4aa6fca61824b711bb933d10dc01000f74e"
     },
     {
       "task_type": "flake",

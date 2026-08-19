@@ -64,8 +64,8 @@ always-loaded notes from detailed reference notes that agents read only when rel
 - Type: `short`
 - Description: No description set.
 - Parent: `AGENTS.md`
-- Lines: 94
-- Approx. tokens: 925
+- Lines: 83
+- Approx. tokens: 820
 
 ### `sase/memory/sase_beads.md`
 
@@ -92,8 +92,8 @@ always-loaded notes from detailed reference notes that agents read only when rel
 - Total notes: 4
 - Short notes: 2
 - Long notes: 2
-- Total lines: 313
-- Total approx. tokens: 3726
+- Total lines: 302
+- Total approx. tokens: 3621
 
 ## Commands
 
