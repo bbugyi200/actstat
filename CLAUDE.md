@@ -11,9 +11,31 @@ ask for separate permission to initialize sase memory in that case.
 
 The following memories contain core (always loaded) context:
 
-### 1.1 SASE = Structured Agentic Software Engineering (sase)
+### 1.1 Artifact Relation Registry (artifact_relations)
 
-#### 1.1.1 Ephemeral `actstat_<N>` Workspace Directories
+Typed artifact links use this closed relation registry. Agents write deliberate links
+with `sase artifact link add <source> <relation> <target> "<why>"`; prompt citations and
+audited reads use the same row shape.
+
+#### 1.1.1 Relations
+
+- `cites`: inverse `cited-by`, directed yes, written by `prompt_ref`.
+- `read`: inverse `read-by`, directed yes, written by `read`.
+- `related`: inverse `related`, directed no, written by `cli`.
+- `supersedes`: inverse `superseded-by`, directed yes, written by `cli`.
+- `implements`: inverse `implemented-by`, directed yes, written by `cli`.
+- `derives-from`: inverse `derived-into`, directed yes, written by `cli`.
+
+#### 1.1.2 Reserved
+
+The following slugs are scheduling concepts, not artifact-link relations:
+
+- `blocks`: use `sase bead dep` instead.
+- `depends-on`: use `sase bead dep` instead.
+
+### 1.2 SASE = Structured Agentic Software Engineering (sase)
+
+#### 1.2.1 Ephemeral `actstat_<N>` Workspace Directories
 
 SASE runs agents (like you) from ephemeral workspace directories, which are full clones
 of the actstat repo. These directories are named `actstat_<N>` where `<N>` is some
@@ -24,7 +46,7 @@ IMPORTANT: Do NOT mention your workspace directory (or any sibling workspace dir
 in any plan files that you generate using your `/sase_plan` skill. The agent(s) that
 implement the plan might not run in the same workspace directory as you!
 
-#### 1.1.2 Repositories
+#### 1.2.2 Repositories
 
 Configured linked and sidecar repositories for this context:
 
@@ -47,16 +69,16 @@ discussions.
 IMPORTANT REMINDER: Do NOT locate, clone, or web-fetch another repo's contents any other
 way than by using `/sase_repo`!
 
-### 1.2 Task Bead Types (task_types)
+### 1.3 Task Bead Types (task_types)
 
 Every task bead can carry a `task_type` drawn from this project's catalog.
 `sase bead task-type list` always shows the live catalog and
 `sase bead task-type show <slug>` shows one type in full; this note is the generated,
 always-current snapshot of the agent-creatable types below.
 
-#### 1.2.1 Types
+#### 1.3.1 Types
 
-##### 1.2.1.1 `bug` — Bug
+##### 1.3.1.1 `bug` — Bug
 
 File one when you found a defect while doing unrelated work and it is not an external
 tracker issue. Record where it lives, how to reproduce it, and who it hurts. Do not use
@@ -68,7 +90,7 @@ this for a flake, a confirmed CI failure, or a GitHub-mirrored bug.
 Run `sase bead task-type show bug` for the full field list, validators, and body
 template.
 
-##### 1.2.1.2 `ci` — CI failure
+##### 1.3.1.2 `ci` — CI failure
 
 File one when a test or lint failed and you confirmed it is a true failure, not a flake.
 Record the pytest node ID, the failing SHA if known, and why this is not intermittent.
@@ -80,7 +102,7 @@ Use flake instead when a rerun on the same tree passed.
 Run `sase bead task-type show ci` for the full field list, validators, and body
 template.
 
-##### 1.2.1.3 `flake` — Flaky test
+##### 1.3.1.3 `flake` — Flaky test
 
 File one when a test or lint failed, a rerun on the same tree passed, and you did not
 cause the failure. Record the fail rate and whether it reproduces serially. Use ci
@@ -92,7 +114,7 @@ instead when the failure is confirmed and reproducible.
 Run `sase bead task-type show flake` for the full field list, validators, and body
 template.
 
-##### 1.2.1.4 `memory` — Memory
+##### 1.3.1.4 `memory` — Memory
 
 File one when a sase memory file or skill contains out-of-date information that should
 be updated. Closing still requires explicit user permission plus `sase memory init`.
@@ -103,7 +125,7 @@ Record the memory path and the proposed change.
 Run `sase bead task-type show memory` for the full field list, validators, and body
 template.
 
-#### 1.2.2 File Discovered Work As Task Beads
+#### 1.3.2 File Discovered Work As Task Beads
 
 Unless your prompt explicitly forbids creating beads (epic phase workers, for example,
 must record `PROPOSED FOLLOW-UP:` notes on their own bead instead), you can and SHOULD

@@ -51,6 +51,14 @@ always-loaded notes from detailed reference notes that agents read only when rel
 
 ## Memory Notes
 
+### `sase/memory/artifact_relations.md`
+
+- Type: `short`
+- Description: No description set.
+- Parent: `AGENTS.md`
+- Lines: 26
+- Approx. tokens: 222
+
 ### `sase/memory/sase.md`
 
 - Type: `short`
@@ -89,11 +97,11 @@ always-loaded notes from detailed reference notes that agents read only when rel
 
 ## Statistics
 
-- Total notes: 4
-- Short notes: 2
+- Total notes: 5
+- Short notes: 3
 - Long notes: 2
-- Total lines: 302
-- Total approx. tokens: 3621
+- Total lines: 328
+- Total approx. tokens: 3843
 
 ## Commands
 
