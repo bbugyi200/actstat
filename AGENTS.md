@@ -154,7 +154,12 @@ The below files contain detailed reference material. When working in their domai
 MUST use your `/sase_memory_read` skill to review their contents. Do not read canonical
 memory files directly.
 
-### 2.1 `sase/memory/sase_beads.md`
+### 2.1 `sase/memory/sase_artifacts.md`
+
+Read before creating, consuming, resolving, linking, or managing retention for SASE
+artifact references and indexed files.
+
+### 2.2 `sase/memory/sase_beads.md`
 
 Read before creating, updating, closing, or querying sase beads — bead types and tiers,
 the status lifecycle agents must never hand-edit, task-bead triage, phase-bead
