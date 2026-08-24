@@ -7,7 +7,7 @@ edit to the canonical note under `sase/memory/`, then you MUST run `sase memory 
 regenerate `AGENTS.md`, the provider instruction shims, and the memory README. Do NOT
 ask for separate permission to initialize sase memory in that case.
 
-## 1. Tier 1 (short-term) Memory
+## 1. Tier 1 (core) Memory
 
 The following memories contain core (always loaded) context:
 
@@ -76,6 +76,10 @@ skill as the last action. This includes a final answer, an incomplete-status res
 an "I will wait" response, or any reply that intends to resume in a later turn. It will
 call `sase final context`, inspect any selected finalizers and repository obligations,
 and submit one atomic declaration with `sase final submit` when the host requires one.
+The declaration must cover every repository you changed this turn, including linked,
+sidecar, or external repos opened through `/sase_repo`. A host prompt scoped to one
+repository's commit or conflict repair does not narrow that obligation for any other
+repository you changed.
 
 After a successful `sase final submit`, do not make more file or repository changes in
 this turn. If the declaration command reports validation errors, repair the manifest and
@@ -162,7 +166,7 @@ link, and records the issue in the right place. Only a genuinely new task become
 beads are proposed to the project owner, who either launches an agent to work them or
 closes them with a reason.
 
-## 2. Tier 2 (long-term) Memory
+## 2. Tier 2 (reference) Memory
 
 The below files contain detailed reference material. When working in their domain, you
 MUST use your `/sase_memory_read` skill to review their contents. Do not read canonical
