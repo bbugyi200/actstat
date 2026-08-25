@@ -83,7 +83,7 @@ into `AGENTS.md`, no matter what tier its web renders at.
 - Description: No description set.
 - Parent: `AGENTS.md`
 - Lines: 49
-- Approx. tokens: 539
+- Approx. tokens: 545
 
 ### `sase/memory/sase_artifacts.md`
 
@@ -103,7 +103,7 @@ into `AGENTS.md`, no matter what tier its web renders at.
   semantics.
 - Parent: `AGENTS.md`
 - Lines: 142
-- Approx. tokens: 1920
+- Approx. tokens: 1924
 
 ### `sase/memory/sase_sizes.md`
 
@@ -120,7 +120,7 @@ into `AGENTS.md`, no matter what tier its web renders at.
 - Core notes: 2
 - Reference notes: 3
 - Total lines: 420
-- Total approx. tokens: 5144
+- Total approx. tokens: 5154
 
 ## Commands
 
