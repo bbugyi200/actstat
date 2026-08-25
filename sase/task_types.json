@@ -106,7 +106,7 @@
       "create_refusal": "Agents never create this type with `sase bead create` or `/sase_new_task` when it is not agent-creatable. That is the machine-global override outside the SASE project. File a feature bead only in SASE, or use an in-scope type here.",
       "glyph": "✦",
       "accent_color": "#5FD75F",
-      "agent_creatable": false,
+      "agent_creatable": true,
       "fields": [
         {
           "name": "proposal",
@@ -133,9 +133,9 @@
       "triage": {
         "min_plus_ones": 0
       },
-      "source": "project",
-      "package": "project",
-      "digest": "25c171d60599d599945fb50757f441121e81c438b359237d9c1c82efd64e4293"
+      "source": "builtin",
+      "package": "sase",
+      "digest": "9445f9171caf31b5c39e2cf460db3ca9097dd147d74e14907a156a40fa340b44"
     },
     {
       "task_type": "flake",

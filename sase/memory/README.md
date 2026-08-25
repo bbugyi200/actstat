@@ -69,29 +69,21 @@ into `AGENTS.md`, no matter what tier its web renders at.
 
 ## Memory Notes
 
-### `sase/memory/artifact_relations.md`
-
-- Type: `core`
-- Description: No description set.
-- Parent: `AGENTS.md`
-- Lines: 26
-- Approx. tokens: 222
-
 ### `sase/memory/sase.md`
 
 - Type: `core`
 - Description: No description set.
 - Parent: `AGENTS.md`
-- Lines: 59
-- Approx. tokens: 772
+- Lines: 84
+- Approx. tokens: 1154
 
 ### `sase/memory/task_types.md`
 
 - Type: `core`
 - Description: No description set.
 - Parent: `AGENTS.md`
-- Lines: 47
-- Approx. tokens: 515
+- Lines: 49
+- Approx. tokens: 539
 
 ### `sase/memory/sase_artifacts.md`
 
@@ -99,8 +91,8 @@ into `AGENTS.md`, no matter what tier its web renders at.
 - Description: Read before creating, consuming, resolving, linking, or managing
   retention for SASE artifact references and indexed files.
 - Parent: `AGENTS.md`
-- Lines: 94
-- Approx. tokens: 949
+- Lines: 105
+- Approx. tokens: 1058
 
 ### `sase/memory/sase_beads.md`
 
@@ -124,11 +116,11 @@ into `AGENTS.md`, no matter what tier its web renders at.
 
 ## Statistics
 
-- Total notes: 6
-- Core notes: 3
+- Total notes: 5
+- Core notes: 2
 - Reference notes: 3
-- Total lines: 408
-- Total approx. tokens: 4851
+- Total lines: 420
+- Total approx. tokens: 5144
 
 ## Commands
 
