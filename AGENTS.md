@@ -90,8 +90,6 @@ Every task bead can carry a `task_type` drawn from this project's catalog.
 `sase memory read task_types:<slug> -r "<why>"` for one generated type in full. This
 note is the generated, always-current snapshot of the agent-creatable types below.
 
-<!-- sase:strands -->
-
 - **Bug** (`bug`) - A defect an agent found while doing unrelated work, not an external
   tracker bug.
 - **CI failure** (`ci`) - A confirmed true test or lint failure, not a flake.
@@ -99,8 +97,6 @@ note is the generated, always-current snapshot of the agent-creatable types belo
   list.
 - **Flaky test** (`flake`) - A test that fails and then passes on an unchanged tree.
 - **Memory** (`memory`) - A sase memory note or skill that is out of date.
-
-<!-- /sase:strands -->
 
 #### 1.2.1 File Discovered Work As Task Beads
 
