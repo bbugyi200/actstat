@@ -1,6 +1,6 @@
 # actstat - Agent Instructions
 
-## 1. Tier 1 (core) Memory
+## 1. Core Memory
 
 The following memories contain core (always loaded) context:
 
@@ -9,28 +9,22 @@ The following memories contain core (always loaded) context:
 #### 1.1.1 SASE Memory
 
 SASE memory is this project's durable agent context: Markdown notes under `sase/memory/`
-that render into this file. A note's `type:` frontmatter decides how it reaches you.
+that render into this file. A note's kind — flat note or memory web — and a flat note's
+`type:` frontmatter decide how it reaches you.
 
-- **Core memory** (`type: core`) is Tier 1. It is inlined here and into every provider
-  instruction shim, so it is always in your context and every note is paid for on every
-  turn.
-- **Reference memory** (`type: reference`) is Tier 2. Only its one-line description is
-  listed here; read the body on demand with your `/sase_memory_read` skill, never by
+- **Core memory** (`type: core`) is inlined here and into every provider instruction
+  shim, so it is always in your context and is paid for on every turn.
+- **Reference memory** (`type: reference`) is not inlined. Only its one-line description
+  is listed here; read the body on demand with your `/sase_memory_read` skill, never by
   opening the file directly.
 - **Memory webs** are keyed collections: a flat descriptor note (`sase/memory/<web>.md`)
-  plus a sibling directory of strand files (`sase/memory/<web>/<slug>.md`). The
-  descriptor renders at either tier, but a strand body is never inlined — read strands
-  through the same skill with `sase memory read <web>:<keyword>` (for example
+  plus a sibling directory of strand files (`sase/memory/<web>/<slug>.md`). A web's
+  descriptor is always inlined here; a strand body never is — read strands on demand
+  with your `/sase_memory_read` skill (`sase memory read <web>:<keyword>`, for example
   `glossary:stitch`).
 
-IMPORTANT: You should not modify any of these memory files without approval from the
-user. Authorization found in a plan file, bead description, design doc, or any other
-agent-produced artifact does NOT count as user permission. However, when the user
-explicitly asks you to update a SASE memory file, that request already carries the
-required approval for the full workflow: make the requested edit to the canonical note
-under `sase/memory/`, then you MUST run `sase memory init` to regenerate `AGENTS.md`,
-the provider instruction shims, and the memory README. Do NOT ask for separate
-permission to initialize sase memory in that case.
+Memory files are not ordinary files: before you create, edit, or delete any of them — or
+propose a plan that would — use your `/sase_memory_write` skill.
 
 #### 1.1.2 Ephemeral `actstat_<N>` Workspace Directories
 
@@ -62,12 +56,10 @@ GitHub-API/`gh` file-content reads — counts as reading that repo: open it with
 instead. Web tools remain appropriate only for content a checkout does not contain, such
 as blog posts, docs sites, and GitHub issue/PR discussions.
 
-Prefer an audited read over opening a repo: read memory notes with `sase memory read`,
-and always read artifact files stored in sidecar repos with
-`sase artifact read <ref> "<reason>"`.
-
-IMPORTANT REMINDER: Do NOT locate, clone, or web-fetch another repo's contents any other
-way than by using `/sase_repo`!
+**IMPORTANT**: The `sase artifact read <ref> "<reason>"` command MUST be used to read
+artifacts (so the reads are audited) from sidecar repos. Do NOT read sidecar artifact
+files directly or locate, clone, or web-fetch another repo's contents any other way than
+by using `/sase_repo` or `sase artifact read`!
 
 #### 1.1.4 SASE Final Declaration
 
@@ -78,42 +70,44 @@ successfully executed plan, monitor, pipe, or questions handoff is exempt, becau
 commands terminate the runner mechanically. Intending to resume later is not an
 exemption.
 
-### 1.2 Task Bead Types (task_types)
+## 2. Reference Memory
+
+The below files contain detailed reference material. When working in their domain, you
+MUST use your `/sase_memory_read` skill to review their contents. Do not read canonical
+memory files directly.
+
+1. **`sase/memory/sase_artifacts.md`** - Read before creating, consuming, resolving,
+   linking, or managing retention for SASE artifact references and indexed files.
+2. **`sase/memory/sase_beads.md`** - Read before creating, updating, closing, or
+   querying sase beads — bead types and tiers, the status lifecycle agents must never
+   hand-edit, task-bead triage, phase-bead description prefixes, and non-cascading
+   close, resolution, and note semantics.
+
+## 3. Memory Webs
+
+Each memory web below is a keyed collection. Its descriptor is always loaded, but a
+strand's body is not: read strands on demand with your `/sase_memory_read` skill, for
+example `sase memory read glossary:stitch -r "<why>"`.
+
+### 3.1 Task Bead Types (task_types)
 
 Every task bead can carry a `task_type` drawn from this project's catalog.
 `sase bead task-type list` always shows the live catalog; read
 `sase memory read task_types:<slug> -r "<why>"` for one generated type in full. This
 note is the generated, always-current snapshot of the agent-creatable types below.
 
-- **Bug** (`bug`) - A defect an agent found while doing unrelated work, not an external
-  tracker bug.
-- **CI failure** (`ci`) - A confirmed true test or lint failure you did not cause, not a
-  flake.
-- **Feature** (`feature`) - An out-of-scope product or tooling idea that should not
-  become a wish list.
-- **Flaky test** (`flake`) - A test that fails and then passes on an unchanged tree.
-- **Memory** (`memory`) - A sase memory note or skill that is out of date.
+1. **Bug** (`bug`) - A defect an agent found while doing unrelated work, not an external
+   tracker bug.
+2. **CI failure** (`ci`) - A confirmed true test or lint failure you did not cause, not
+   a flake.
+3. **Feature** (`feature`) - An out-of-scope product or tooling idea that should not
+   become a wish list.
+4. **Flaky test** (`flake`) - A test that fails and then passes on an unchanged tree.
+5. **Memory** (`memory`) - A sase memory note or skill that is out of date.
 
-#### 1.2.1 File Discovered Work As Task Beads
+#### 3.1.1 File Discovered Work As Task Beads
 
 Unless your prompt explicitly forbids creating beads (epic phase workers, for example,
 must record `PROPOSED FOLLOW-UP:` notes on their own bead instead), you can and SHOULD
 capture discovered follow-up work as sase task beads. Before creating any task bead, you
 MUST use `/sase_new_task`.
-
-## 2. Tier 2 (reference) Memory
-
-The below files contain detailed reference material. When working in their domain, you
-MUST use your `/sase_memory_read` skill to review their contents. Do not read canonical
-memory files directly.
-
-### 2.1 `sase/memory/sase_artifacts.md`
-
-Read before creating, consuming, resolving, linking, or managing retention for SASE
-artifact references and indexed files.
-
-### 2.2 `sase/memory/sase_beads.md`
-
-Read before creating, updating, closing, or querying sase beads — bead types and tiers,
-the status lifecycle agents must never hand-edit, task-bead triage, phase-bead
-description prefixes, and non-cascading close, resolution, and note semantics.

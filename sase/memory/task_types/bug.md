@@ -28,6 +28,11 @@ tracker issue. Record where it lives, how to reproduce it, and who it hurts; one
 independent reproduction separates it from a misreading. Do not use this for a flake, a
 confirmed CI failure, or a GitHub-mirrored bug.
 
+## Related Task Types
+
+- [[task_types/ci]]
+- [[task_types/flake]]
+
 ## Fields
 
 **Field `location`**
@@ -81,4 +86,3 @@ confirmed CI failure, or a GitHub-mirrored bug.
 - Provenance label: `builtin:sase`
 - Source: `builtin`
 - Package: `sase`
-- Version: `0.16.0`

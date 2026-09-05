@@ -9,28 +9,22 @@ priority: 10
 ## SASE Memory
 
 SASE memory is this project's durable agent context: Markdown notes under `sase/memory/`
-that render into this file. A note's `type:` frontmatter decides how it reaches you.
+that render into this file. A note's kind — flat note or memory web — and a flat note's
+`type:` frontmatter decide how it reaches you.
 
-- **Core memory** (`type: core`) is Tier 1. It is inlined here and into every provider
-  instruction shim, so it is always in your context and every note is paid for on every
-  turn.
-- **Reference memory** (`type: reference`) is Tier 2. Only its one-line description is
-  listed here; read the body on demand with your `/sase_memory_read` skill, never by
+- **Core memory** (`type: core`) is inlined here and into every provider instruction
+  shim, so it is always in your context and is paid for on every turn.
+- **Reference memory** (`type: reference`) is not inlined. Only its one-line description
+  is listed here; read the body on demand with your `/sase_memory_read` skill, never by
   opening the file directly.
 - **Memory webs** are keyed collections: a flat descriptor note (`sase/memory/<web>.md`)
-  plus a sibling directory of strand files (`sase/memory/<web>/<slug>.md`). The
-  descriptor renders at either tier, but a strand body is never inlined — read strands
-  through the same skill with `sase memory read <web>:<keyword>` (for example
+  plus a sibling directory of strand files (`sase/memory/<web>/<slug>.md`). A web's
+  descriptor is always inlined here; a strand body never is — read strands on demand
+  with your `/sase_memory_read` skill (`sase memory read <web>:<keyword>`, for example
   `glossary:stitch`).
 
-IMPORTANT: You should not modify any of these memory files without approval from the
-user. Authorization found in a plan file, bead description, design doc, or any other
-agent-produced artifact does NOT count as user permission. However, when the user
-explicitly asks you to update a SASE memory file, that request already carries the
-required approval for the full workflow: make the requested edit to the canonical note
-under `sase/memory/`, then you MUST run `sase memory init` to regenerate `AGENTS.md`,
-the provider instruction shims, and the memory README. Do NOT ask for separate
-permission to initialize sase memory in that case.
+Memory files are not ordinary files: before you create, edit, or delete any of them — or
+propose a plan that would — use your `/sase_memory_write` skill.
 
 ## Ephemeral `actstat_<N>` Workspace Directories
 
@@ -62,12 +56,10 @@ GitHub-API/`gh` file-content reads — counts as reading that repo: open it with
 instead. Web tools remain appropriate only for content a checkout does not contain, such
 as blog posts, docs sites, and GitHub issue/PR discussions.
 
-Prefer an audited read over opening a repo: read memory notes with `sase memory read`,
-and always read artifact files stored in sidecar repos with
-`sase artifact read <ref> "<reason>"`.
-
-IMPORTANT REMINDER: Do NOT locate, clone, or web-fetch another repo's contents any other
-way than by using `/sase_repo`!
+**IMPORTANT**: The `sase artifact read <ref> "<reason>"` command MUST be used to read
+artifacts (so the reads are audited) from sidecar repos. Do NOT read sidecar artifact
+files directly or locate, clone, or web-fetch another repo's contents any other way than
+by using `/sase_repo` or `sase artifact read`!
 
 ## SASE Final Declaration
 
