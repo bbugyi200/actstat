@@ -99,8 +99,8 @@ strand inherits no `type:` of its own and never inlines into `AGENTS.md`.
 
 - Kind: memory web descriptor
 - Description: No description set.
-- Lines: 32
-- Approx. tokens: 309
+- Lines: 34
+- Approx. tokens: 310
 
 ### `sase/memory/sase_artifacts.md`
 
@@ -137,8 +137,8 @@ strand inherits no `type:` of its own and never inlines into `AGENTS.md`.
 - Core notes: 1
 - Reference notes: 3
 - Web descriptor notes: 1
-- Total lines: 392
-- Total approx. tokens: 4698
+- Total lines: 394
+- Total approx. tokens: 4699
 
 ## Commands
 
