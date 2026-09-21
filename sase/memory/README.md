@@ -119,8 +119,8 @@ strand inherits no `type:` of its own and never inlines into `AGENTS.md`.
   types and tiers, the status lifecycle agents must never hand-edit, task-bead triage,
   phase-bead description prefixes, and non-cascading close, resolution, and note
   semantics.
-- Lines: 142
-- Approx. tokens: 1907
+- Lines: 145
+- Approx. tokens: 1949
 
 ### `sase/memory/sase_sizes.md`
 
@@ -137,8 +137,8 @@ strand inherits no `type:` of its own and never inlines into `AGENTS.md`.
 - Core notes: 1
 - Reference notes: 3
 - Web descriptor notes: 1
-- Total lines: 394
-- Total approx. tokens: 4699
+- Total lines: 397
+- Total approx. tokens: 4741
 
 ## Commands
 
